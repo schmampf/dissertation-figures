@@ -2,3 +2,6 @@
 *.npz
 *.pyc
 .DS_Store
+pyproject.toml
+.vscode/*
+__pycache__/*
