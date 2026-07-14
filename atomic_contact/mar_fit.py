@@ -13,9 +13,11 @@ therefore a fit-grid dimension, but not a native HDF5-cache dimension.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from itertools import product
 from math import comb
 from time import perf_counter
+from typing import Literal
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -24,9 +26,14 @@ from superconductivity.models.basics.noise import (
     make_bias_support_grid,
 )
 from superconductivity.models.mar import get_Imar_nA
-from superconductivity.models.mar.core import SymmetricHAParams, quantize_voltage_mV
+from superconductivity.models.mar.core import (
+    SymmetricHAParams,
+    quantize_voltage_mV,
+)
 from superconductivity.models.mar.core.cache import locked_h5_file
-from superconductivity.models.mar.models.ha_sym import CACHE_FILE as HA_SYM_CACHE_FILE
+from superconductivity.models.mar.models.ha_sym import (
+    CACHE_FILE as HA_SYM_CACHE_FILE,
+)
 from superconductivity.models.mar.models.ha_sym import (
     CACHE_ROOT_GROUP as HA_SYM_CACHE_ROOT,
 )
@@ -35,6 +42,7 @@ from tqdm.auto import tqdm
 
 FloatArray = NDArray[np.float64]
 IntArray = NDArray[np.int32]
+FitBackend = Literal["auto", "jax", "numpy"]
 
 
 @dataclass(frozen=True)
@@ -88,7 +96,9 @@ class MARGrid:
             or np.any(self.gamma_meV < 0.0)
             or np.any(self.sigmaV_mV < 0.0)
         ):
-            raise ValueError("T_K, gamma_meV, and sigmaV_mV must be nonnegative.")
+            raise ValueError(
+                "T_K, gamma_meV, and sigmaV_mV must be nonnegative."
+            )
         if np.any(self.Delta_meV <= 0.0):
             raise ValueError("Delta_meV must be positive.")
 
@@ -362,7 +372,9 @@ def prepare_mar_database(
         for i_sigma, sigma in enumerate(grid.sigmaV_mV):
             for i_tau in range(grid.tau.size):
                 if sigma == 0.0:
-                    I_nA[i_tau, i_T, i_delta, i_gamma, i_sigma, :] = base_bank[i_tau]
+                    I_nA[i_tau, i_T, i_delta, i_gamma, i_sigma, :] = base_bank[
+                        i_tau
+                    ]
                     continue
                 broadened_support = apply_voltage_noise(
                     V_support_mV,
@@ -429,6 +441,7 @@ def fit_mar_grid(
     gamma_meV: float | None = None,
     sigmaV_mV: float | None = None,
     batch_size: int = 50_000,
+    backend: FitBackend = "auto",
     progress: bool = True,
 ) -> MARGridFitResult:
     """Search the full MAR, voltage-noise, and pincode grid.
@@ -443,12 +456,18 @@ def fit_mar_grid(
     ``sigmaV_mV`` axis.  All pincodes are scored in batches.  Pass any of
     ``T_K``, ``Delta_meV`` (or ``Delta_mev``), ``gamma_meV``, and
     ``sigmaV_mV`` to restrict that parameter to an already-loaded grid value.
-    The database is neither reloaded nor recalculated.
+    The database is neither reloaded nor recalculated.  ``backend="auto"``
+    uses JAX when it is installed and falls back to memory-bounded NumPy.
+    The JAX scorer keeps the large model and residual arrays inside the
+    compiled calculation and transfers only each batch's minimum back to
+    Python.
     """
     if n_channels < 1:
         raise ValueError("n_channels must be at least one.")
     if batch_size < 1:
         raise ValueError("batch_size must be at least one.")
+    if backend not in ("auto", "jax", "numpy"):
+        raise ValueError("backend must be 'auto', 'jax', or 'numpy'.")
     grid = database.grid
     if database.I_nA.shape != grid.current_shape:
         raise ValueError("database current shape does not match its grid.")
@@ -478,7 +497,9 @@ def fit_mar_grid(
         fit_mask &= (grid.V_mV >= low) & (grid.V_mV <= high)
     V_fit = grid.V_mV[fit_mask]
     if V_fit.size < 2:
-        raise ValueError("fewer than two finite current samples lie in the fit window.")
+        raise ValueError(
+            "fewer than two finite current samples lie in the fit window."
+        )
     I_exp = I_data[fit_mask]
     G_exp = I_exp / (V_fit * G0_muS)
     sigma_G = sigma_data[fit_mask]
@@ -502,7 +523,9 @@ def fit_mar_grid(
         _selected_grid_indices(grid.gamma_meV, gamma_meV, "gamma_meV"),
         _selected_grid_indices(grid.sigmaV_mV, sigmaV_mV, "sigmaV_mV"),
     )
-    total_global = int(np.prod([indices.size for indices in parameter_indices]))
+    total_global = int(
+        np.prod([indices.size for indices in parameter_indices])
+    )
     global_indices = product(*parameter_indices)
     fit_progress = tqdm(
         total=total_global * pincodes.shape[0],
@@ -519,6 +542,7 @@ def fit_mar_grid(
             G_exp,
             sigma_G,
             batch_size,
+            backend=backend,
             progress_bar=fit_progress,
         )
         if chi2 < best_chi2:
@@ -668,7 +692,9 @@ def _extend_current_bank(
 
     left_x = V_mV[:count]
     left_centered = left_x - np.mean(left_x)
-    left_slopes = currents_nA[:, :count] @ left_centered / np.sum(left_centered**2)
+    left_slopes = (
+        currents_nA[:, :count] @ left_centered / np.sum(left_centered**2)
+    )
     left = V_support_mV < V_mV[0]
     extended[:, left] = currents_nA[:, [0]] + left_slopes[:, None] * (
         V_support_mV[left] - V_mV[0]
@@ -676,7 +702,9 @@ def _extend_current_bank(
 
     right_x = V_mV[-count:]
     right_centered = right_x - np.mean(right_x)
-    right_slopes = currents_nA[:, -count:] @ right_centered / np.sum(right_centered**2)
+    right_slopes = (
+        currents_nA[:, -count:] @ right_centered / np.sum(right_centered**2)
+    )
     right = V_support_mV > V_mV[-1]
     extended[:, right] = currents_nA[:, [-1]] + right_slopes[:, None] * (
         V_support_mV[right] - V_mV[-1]
@@ -756,7 +784,10 @@ def broaden_current_bank(
     if sigma == 0.0:
         return currents.copy()
     return np.stack(
-        [apply_voltage_noise(V, current, sigma, order=32) for current in currents]
+        [
+            apply_voltage_noise(V, current, sigma, order=32)
+            for current in currents
+        ]
     )
 
 
@@ -766,26 +797,139 @@ def _best_pincode(
     target: FloatArray,
     sigma: FloatArray,
     batch_size: int,
+    *,
+    backend: FitBackend = "auto",
     progress_bar=None,
 ) -> tuple[float, int, FloatArray]:
+    selected_backend = _select_fit_backend(backend)
+    if selected_backend == "jax":
+        return _best_pincode_jax(
+            bank,
+            pincodes,
+            target,
+            sigma,
+            batch_size,
+            progress_bar,
+        )
+    return _best_pincode_numpy(
+        bank,
+        pincodes,
+        target,
+        sigma,
+        batch_size,
+        progress_bar,
+    )
+
+
+def _select_fit_backend(backend: FitBackend) -> Literal["jax", "numpy"]:
+    """Resolve the requested scoring backend without requiring JAX."""
+    if backend == "numpy":
+        return "numpy"
+    try:
+        import jax  # noqa: F401
+    except ImportError:
+        if backend == "jax":
+            raise ImportError(
+                "backend='jax' requires JAX; install it or use backend='numpy'."
+            ) from None
+        return "numpy"
+    return "jax"
+
+
+def _best_pincode_numpy(
+    bank: FloatArray,
+    pincodes: IntArray,
+    target: FloatArray,
+    sigma: FloatArray,
+    batch_size: int,
+    progress_bar=None,
+) -> tuple[float, int, FloatArray]:
+    """Find the best pincode without a ``batch x channel x voltage`` array."""
     best_chi2 = np.inf
     best_index = -1
     best_current: FloatArray | None = None
     for start in range(0, pincodes.shape[0], batch_size):
         stop = min(start + batch_size, pincodes.shape[0])
-        models = np.sum(bank[pincodes[start:stop]], axis=1)
-        residuals = (models - target[None, :]) / sigma[None, :]
-        chi2 = np.einsum("ij,ij->i", residuals, residuals)
+        batch = pincodes[start:stop]
+        models = np.zeros((batch.shape[0], bank.shape[1]), dtype=np.float64)
+        for channel in range(batch.shape[1]):
+            models += bank[batch[:, channel]]
+        models -= target[None, :]
+        models /= sigma[None, :]
+        chi2 = np.einsum("ij,ij->i", models, models)
         local = int(np.argmin(chi2))
         if chi2[local] < best_chi2:
             best_chi2 = float(chi2[local])
             best_index = start + local
-            best_current = models[local].copy()
+            best_current = np.sum(bank[pincodes[best_index]], axis=0)
         if progress_bar is not None:
             progress_bar.update(stop - start)
     if best_current is None:
         raise RuntimeError("pincode search received no candidates.")
     return best_chi2, best_index, best_current
+
+
+def _best_pincode_jax(
+    bank: FloatArray,
+    pincodes: IntArray,
+    target: FloatArray,
+    sigma: FloatArray,
+    batch_size: int,
+    progress_bar=None,
+) -> tuple[float, int, FloatArray]:
+    """Find the best pincode with a fused, memory-bounded JAX scorer."""
+    import jax
+    import jax.numpy as jnp
+
+    # Use float64 when enabled, otherwise consistently score in float32.  This
+    # avoids changing the process-wide JAX configuration from a library helper.
+    dtype = jnp.float64 if jax.config.x64_enabled else jnp.float32
+    bank_device = jax.device_put(np.asarray(bank, dtype=np.dtype(dtype)))
+    target_device = jax.device_put(np.asarray(target, dtype=np.dtype(dtype)))
+    sigma_device = jax.device_put(np.asarray(sigma, dtype=np.dtype(dtype)))
+
+    batch_minimum = _jax_batch_minimum()
+
+    best_chi2 = np.inf
+    best_index = -1
+    for start in range(0, pincodes.shape[0], batch_size):
+        stop = min(start + batch_size, pincodes.shape[0])
+        batch = np.asarray(pincodes[start:stop], dtype=np.int32)
+        chi2_device, local_device = batch_minimum(
+            bank_device,
+            target_device,
+            sigma_device,
+            jax.device_put(batch),
+        )
+        chi2 = float(chi2_device)
+        local = int(local_device)
+        if chi2 < best_chi2:
+            best_chi2 = chi2
+            best_index = start + local
+        if progress_bar is not None:
+            progress_bar.update(stop - start)
+
+    if best_index < 0:
+        raise RuntimeError("pincode search received no candidates.")
+    best_current = np.sum(bank[pincodes[best_index]], axis=0)
+    return best_chi2, best_index, best_current
+
+
+@lru_cache(maxsize=1)
+def _jax_batch_minimum():
+    """Build one compiled scorer reused across all global grid points."""
+    import jax
+    import jax.numpy as jnp
+
+    @jax.jit
+    def score(bank, target, sigma, indices):
+        models = jnp.sum(bank[indices], axis=1)
+        residuals = (models - target[None, :]) / sigma[None, :]
+        chi2 = jnp.sum(residuals * residuals, axis=1)
+        index = jnp.argmin(chi2)
+        return chi2[index], index
+
+    return score
 
 
 def _fit_uncertainty(
@@ -799,12 +943,15 @@ def _fit_uncertainty(
         sigma = np.full(shape, float(sigma), dtype=np.float64)
     if sigma.shape != shape:
         raise ValueError(
-            "sigmaG_G0 must be scalar or have the same shape as " "database.grid.V_mV."
+            "sigmaG_G0 must be scalar or have the same shape as "
+            "database.grid.V_mV."
         )
     return sigma
 
 
-def _axis(values: ArrayLike, name: str, *, uniform: bool = False) -> FloatArray:
+def _axis(
+    values: ArrayLike, name: str, *, uniform: bool = False
+) -> FloatArray:
     axis = np.asarray(values, dtype=np.float64).reshape(-1)
     if axis.size == 0 or not np.all(np.isfinite(axis)):
         raise ValueError(f"{name} must contain finite values.")
