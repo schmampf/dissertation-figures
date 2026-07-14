@@ -13,16 +13,22 @@ therefore a fit-grid dimension, but not a native HDF5-cache dimension.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import combinations_with_replacement
+from itertools import product
 from math import comb
 from time import perf_counter
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
-from superconductivity.models.mar import get_Imar_nA
 from superconductivity.models.basics.noise import (
     apply_voltage_noise,
     make_bias_support_grid,
+)
+from superconductivity.models.mar import get_Imar_nA
+from superconductivity.models.mar.core import SymmetricHAParams, quantize_voltage_mV
+from superconductivity.models.mar.core.cache import locked_h5_file
+from superconductivity.models.mar.models.ha_sym import CACHE_FILE as HA_SYM_CACHE_FILE
+from superconductivity.models.mar.models.ha_sym import (
+    CACHE_ROOT_GROUP as HA_SYM_CACHE_ROOT,
 )
 from superconductivity.utilities.constants import G0_muS
 from tqdm.auto import tqdm
@@ -131,11 +137,69 @@ class MARGridFitResult:
     fitting_time_s: float
 
 
+def _bulk_read_mar_cache(
+    V_mV: FloatArray,
+    grid: MARGrid,
+    output: FloatArray,
+    parameter_indices: list[tuple[int, ...]],
+    *,
+    desc: str,
+    progress: bool,
+) -> list[tuple[int, ...]]:
+    """Fill complete symmetric-HA curves during one HDF5 session."""
+    nonzero = V_mV != 0.0
+    V_lookup_q = quantize_voltage_mV(np.abs(V_mV[nonzero]))
+    missing = []
+    iterator = tqdm(
+        parameter_indices,
+        desc=desc,
+        unit="curve",
+        disable=not progress,
+    )
+    with locked_h5_file(HA_SYM_CACHE_FILE, "a") as handle:
+        for indices in iterator:
+            i_tau, i_T, i_delta, i_gamma = indices
+            tau = float(grid.tau[i_tau])
+            if tau == 0.0:
+                output[indices] = 0.0
+                continue
+
+            params = SymmetricHAParams.from_raw(
+                tau=tau,
+                T_K=float(grid.T_K[i_T]),
+                Delta_meV=float(grid.Delta_meV[i_delta]),
+                gamma_meV=float(grid.gamma_meV[i_gamma]),
+                gamma_meV_min=1.0e-4,
+            )
+            group_path = f"{HA_SYM_CACHE_ROOT}/{params.cache_key()}"
+            if group_path not in handle:
+                missing.append(indices)
+                continue
+
+            group = handle[group_path]
+            V_cached_q = np.asarray(group["V_q"][...], dtype=np.int64)
+            I_cached_nA = np.asarray(group["I_nA"][...], dtype=np.float64)
+            positions = np.searchsorted(V_cached_q, V_lookup_q)
+            complete = np.all(positions < V_cached_q.size)
+            if complete:
+                complete = np.array_equal(
+                    V_cached_q[positions],
+                    V_lookup_q,
+                )
+            if not complete:
+                missing.append(indices)
+                continue
+
+            current = np.zeros_like(V_mV)
+            current[nonzero] = np.sign(V_mV[nonzero]) * I_cached_nA[positions]
+            output[indices] = current
+    return missing
+
+
 def prepare_mar_trace(
     V_mV,
     I_nA,
     Vnan_mV=0.03,
-    VGN_mV=0.5,
 ):
     """Return a fit mask and estimate GN/G0 from the outer IV plateaus."""
     V_mV = np.asarray(V_mV, dtype=np.float64)
@@ -146,29 +210,61 @@ def prepare_mar_trace(
 
     finite = np.isfinite(V_mV) & np.isfinite(I_nA)
     mask = finite & (np.abs(V_mV) > Vnan_mV)
-    plateau = finite & (np.abs(V_mV) >= VGN_mV)
+    return mask
 
-    slopes_uS = []
+
+def estimate_GN_bounds(
+    V_mV,
+    I_nA,
+    VGN_mV=0.5,
+    n_sections=4,
+    confidence=2.0,
+):
+    V_mV = np.asarray(V_mV, dtype=np.float64)
+    I_nA = np.asarray(I_nA, dtype=np.float64)
+
+    finite = np.isfinite(V_mV) & np.isfinite(I_nA)
+    slopes_G0 = []
+
     for polarity in (-1, 1):
-        select = plateau & (np.sign(V_mV) == polarity)
-        if np.count_nonzero(select) >= 2:
+        select = finite & (polarity * V_mV >= VGN_mV)
+        indices = np.flatnonzero(select)
+
+        for section in np.array_split(indices, n_sections):
+            if section.size < 2:
+                continue
+
             slope_uS, _ = np.polyfit(
-                V_mV[select],
-                I_nA[select],
+                V_mV[section],
+                I_nA[section],
                 deg=1,
             )
-            slopes_uS.append(slope_uS)
+            slopes_G0.append(slope_uS / G0_muS)
 
-    if not slopes_uS:
-        raise ValueError("Not enough finite points on the outer IV plateaus.")
+    if len(slopes_G0) < 2:
+        raise ValueError("Not enough plateau sections to estimate bounds.")
 
-    GN_G0 = float(np.mean(slopes_uS) / G0_muS)
-    return mask, GN_G0
+    slopes_G0 = np.asarray(slopes_G0)
+    GN_G0 = float(np.median(slopes_G0))
+
+    sigma_GN_G0 = float(1.4826 * np.median(np.abs(slopes_G0 - GN_G0)))
+    delta_GN_G0 = max(
+        confidence * sigma_GN_G0,
+        0.02 * GN_G0,
+        0.02,
+    )
+
+    bounds = (
+        max(0.0, GN_G0 - delta_GN_G0),
+        GN_G0 + delta_GN_G0,
+    )
+    return GN_G0, bounds
 
 
 def prepare_mar_database(
     grid: MARGrid,
     *,
+    extrapolation_points: int = 25,
     progress: bool = True,
 ) -> MARDatabase:
     """Assemble a dense grid using the native MAR cache.
@@ -182,6 +278,10 @@ def prepare_mar_database(
     ----------
     grid
         Requested voltage and MAR parameter axes.
+    extrapolation_points
+        Number of points at each voltage edge used to linearly extrapolate
+        the IV onto the Gaussian-convolution padding.  This avoids expensive
+        MAR calculations outside ``grid.V_mV``.
     progress
         Show a notebook-aware progress bar while loading the grid.
     """
@@ -189,71 +289,94 @@ def prepare_mar_database(
         grid.V_mV,
         float(np.max(grid.sigmaV_mV)),
     )
+    if extrapolation_points < 2:
+        raise ValueError("extrapolation_points must be at least two.")
     base_shape = (
         grid.tau.size,
         grid.T_K.size,
         grid.Delta_meV.size,
         grid.gamma_meV.size,
-        V_support_mV.size,
+        grid.V_mV.size,
     )
-    base_I_nA = np.empty(base_shape, dtype=np.float64)
+    base_I_nA = np.full(base_shape, np.nan, dtype=np.float64)
     parameter_indices = list(np.ndindex(base_shape[:-1]))
     total = len(parameter_indices)
     start = perf_counter()
-    iterator = tqdm(
+    missing = _bulk_read_mar_cache(
+        grid.V_mV,
+        grid,
+        base_I_nA,
         parameter_indices,
-        desc="MAR curves",
+        desc="MAR cache read",
+        progress=progress,
+    )
+    iterator = tqdm(
+        missing,
+        desc="Missing MAR curves",
         unit="curve",
-        disable=not progress,
+        disable=not progress or not missing,
     )
     for i_tau, i_T, i_delta, i_gamma in iterator:
         base_I_nA[i_tau, i_T, i_delta, i_gamma] = get_Imar_nA(
-            V_mV=V_support_mV,
+            V_mV=grid.V_mV,
             tau=float(grid.tau[i_tau]),
             T_K=float(grid.T_K[i_T]),
             Delta_meV=float(grid.Delta_meV[i_delta]),
             gamma_meV=float(grid.gamma_meV[i_gamma]),
             caching=True,
         )
+    if missing:
+        _bulk_read_mar_cache(
+            grid.V_mV,
+            grid,
+            base_I_nA,
+            parameter_indices,
+            desc="MAR cache reread",
+            progress=progress,
+        )
+    if not np.all(np.isfinite(base_I_nA)):
+        raise RuntimeError("MAR cache remains incomplete after calculation.")
 
     I_nA = np.empty(grid.current_shape, dtype=np.float64)
-    global_indices = np.ndindex(
-        grid.T_K.size,
-        grid.Delta_meV.size,
-        grid.gamma_meV.size,
+    global_indices = list(
+        np.ndindex(
+            grid.T_K.size,
+            grid.Delta_meV.size,
+            grid.gamma_meV.size,
+        )
     )
-    broadening_jobs = [
-        (i_T, i_delta, i_gamma, i_sigma)
-        for i_T, i_delta, i_gamma in global_indices
-        for i_sigma in range(grid.sigmaV_mV.size)
-    ]
-    broadening_iterator = tqdm(
-        broadening_jobs,
+    broadening_progress = tqdm(
+        total=len(global_indices) * grid.sigmaV_mV.size,
         desc="Voltage noise",
         unit="bank",
         disable=not progress,
     )
-    for i_T, i_delta, i_gamma, i_sigma in broadening_iterator:
-        sigma = float(grid.sigmaV_mV[i_sigma])
-        for i_tau in range(grid.tau.size):
-            if sigma == 0.0:
+    for i_T, i_delta, i_gamma in global_indices:
+        base_bank = base_I_nA[:, i_T, i_delta, i_gamma, :]
+        support_bank = _extend_current_bank(
+            grid.V_mV,
+            base_bank,
+            V_support_mV,
+            extrapolation_points,
+        )
+        for i_sigma, sigma in enumerate(grid.sigmaV_mV):
+            for i_tau in range(grid.tau.size):
+                if sigma == 0.0:
+                    I_nA[i_tau, i_T, i_delta, i_gamma, i_sigma, :] = base_bank[i_tau]
+                    continue
+                broadened_support = apply_voltage_noise(
+                    V_support_mV,
+                    support_bank[i_tau],
+                    float(sigma),
+                    order=32,
+                )
                 I_nA[i_tau, i_T, i_delta, i_gamma, i_sigma, :] = np.interp(
                     grid.V_mV,
                     V_support_mV,
-                    base_I_nA[i_tau, i_T, i_delta, i_gamma, :],
+                    broadened_support,
                 )
-                continue
-            broadened_support = apply_voltage_noise(
-                V_support_mV,
-                base_I_nA[i_tau, i_T, i_delta, i_gamma, :],
-                sigma,
-                order=32,
-            )
-            I_nA[i_tau, i_T, i_delta, i_gamma, i_sigma, :] = np.interp(
-                grid.V_mV,
-                V_support_mV,
-                broadened_support,
-            )
+            broadening_progress.update(1)
+    broadening_progress.close()
 
     elapsed = perf_counter() - start
     return MARDatabase(
@@ -264,6 +387,34 @@ def prepare_mar_database(
     )
 
 
+def _selected_grid_indices(
+    axis: FloatArray,
+    fixed_value: float | None,
+    name: str,
+) -> NDArray[np.int64]:
+    """Return all indices or the index of one existing grid value."""
+    if fixed_value is None:
+        return np.arange(axis.size, dtype=np.int64)
+    value = float(fixed_value)
+    if not np.isfinite(value):
+        raise ValueError(f"{name} must be finite when fixed.")
+    matches = np.flatnonzero(
+        np.isclose(
+            axis,
+            value,
+            rtol=0.0,
+            atol=np.finfo(np.float64).eps * max(1.0, abs(value)) * 8.0,
+        )
+    )
+    if matches.size == 0:
+        nearest = int(np.argmin(np.abs(axis - value)))
+        raise ValueError(
+            f"fixed {name}={value!r} is not in the loaded MAR grid; "
+            f"nearest available value is {float(axis[nearest])!r}."
+        )
+    return np.asarray([matches[0]], dtype=np.int64)
+
+
 def fit_mar_grid(
     I_nA: ArrayLike,
     database: MARDatabase,
@@ -272,6 +423,11 @@ def fit_mar_grid(
     tau_sum_bounds: tuple[float, float] = (0.0, np.inf),
     sigmaG_G0: ArrayLike | float | None = None,
     voltage_bounds_mV: tuple[float, float] | None = None,
+    T_K: float | None = None,
+    Delta_meV: float | None = None,
+    Delta_mev: float | None = None,
+    gamma_meV: float | None = None,
+    sigmaV_mV: float | None = None,
     batch_size: int = 50_000,
     progress: bool = True,
 ) -> MARGridFitResult:
@@ -284,7 +440,10 @@ def fit_mar_grid(
     tested, optionally restricted by total transmission.
 
     Voltage broadening is already precalculated along the grid's
-    ``sigmaV_mV`` axis.  All pincodes are scored in batches.
+    ``sigmaV_mV`` axis.  All pincodes are scored in batches.  Pass any of
+    ``T_K``, ``Delta_meV`` (or ``Delta_mev``), ``gamma_meV``, and
+    ``sigmaV_mV`` to restrict that parameter to an already-loaded grid value.
+    The database is neither reloaded nor recalculated.
     """
     if n_channels < 1:
         raise ValueError("n_channels must be at least one.")
@@ -295,6 +454,9 @@ def fit_mar_grid(
         raise ValueError("database current shape does not match its grid.")
     if not np.all(np.isfinite(database.I_nA)):
         raise ValueError("database contains missing or non-finite IVs.")
+    if Delta_meV is not None and Delta_mev is not None:
+        raise ValueError("pass only one of Delta_meV and Delta_mev.")
+    fixed_delta_meV = Delta_meV if Delta_meV is not None else Delta_mev
 
     I_data = np.asarray(I_nA, dtype=np.float64)
     if I_data.shape != grid.V_mV.shape:
@@ -334,15 +496,14 @@ def fit_mar_grid(
     best_indices: tuple[int, int, int, int, int] | None = None
     best_current: FloatArray | None = None
     start = perf_counter()
-    total_global = (
-        grid.T_K.size * grid.Delta_meV.size * grid.gamma_meV.size * grid.sigmaV_mV.size
+    parameter_indices = (
+        _selected_grid_indices(grid.T_K, T_K, "T_K"),
+        _selected_grid_indices(grid.Delta_meV, fixed_delta_meV, "Delta_meV"),
+        _selected_grid_indices(grid.gamma_meV, gamma_meV, "gamma_meV"),
+        _selected_grid_indices(grid.sigmaV_mV, sigmaV_mV, "sigmaV_mV"),
     )
-    global_indices = np.ndindex(
-        grid.T_K.size,
-        grid.Delta_meV.size,
-        grid.gamma_meV.size,
-        grid.sigmaV_mV.size,
-    )
+    total_global = int(np.prod([indices.size for indices in parameter_indices]))
+    global_indices = product(*parameter_indices)
     fit_progress = tqdm(
         total=total_global * pincodes.shape[0],
         desc="MAR fit",
@@ -418,33 +579,109 @@ def generate_pincodes(
     tau_sum_bounds: tuple[float, float] = (0.0, np.inf),
     progress: bool = False,
 ) -> IntArray:
-    """Return nondecreasing transmission-index combinations in bounds."""
+    """Return conductance-constrained pincodes using branch-and-bound.
+
+    Channel permutations are removed by generating nondecreasing transmission
+    indices.  A partial pincode is pruned when its smallest possible
+    completion exceeds the upper conductance bound or its largest possible
+    completion cannot reach the lower bound.
+    """
     tau_grid = _parameter_axis(tau, "tau", 4)
     if n_channels < 1:
         raise ValueError("n_channels must be at least one.")
     lower, upper = map(float, tau_sum_bounds)
     if lower > upper:
         raise ValueError("tau_sum_bounds must satisfy lower <= upper.")
-    candidates = combinations_with_replacement(
-        range(tau_grid.size),
-        n_channels,
-    )
     total = comb(tau_grid.size + n_channels - 1, n_channels)
-    iterator = tqdm(
-        candidates,
+    progress_bar = tqdm(
         total=total,
         desc="Pincodes",
         unit="candidate",
         disable=not progress,
     )
-    accepted = []
-    for indices in iterator:
-        transmission = sum(tau_grid[index] for index in indices)
-        if lower <= transmission <= upper:
-            accepted.append(indices)
+    accepted: list[tuple[int, ...]] = []
+    prefix: list[int] = []
+    pending_progress = 0
+
+    def completion_count(start: int, remaining: int) -> int:
+        if remaining == 0:
+            return 1
+        return comb(tau_grid.size - start + remaining - 1, remaining)
+
+    def advance(count: int) -> None:
+        nonlocal pending_progress
+        pending_progress += count
+        if pending_progress >= 10_000:
+            progress_bar.update(pending_progress)
+            pending_progress = 0
+
+    def search(start: int, remaining: int, transmission: float) -> None:
+        possibilities = completion_count(start, remaining)
+        tolerance = 1.0e-12
+
+        if transmission > upper + tolerance:
+            advance(possibilities)
+            return
+        if remaining == 0:
+            if lower - tolerance <= transmission <= upper + tolerance:
+                accepted.append(tuple(prefix))
+            advance(1)
+            return
+
+        minimum = transmission + remaining * tau_grid[start]
+        maximum = transmission + remaining * tau_grid[-1]
+        if minimum > upper + tolerance or maximum < lower - tolerance:
+            advance(possibilities)
+            return
+
+        for index in range(start, tau_grid.size):
+            prefix.append(index)
+            search(
+                index,
+                remaining - 1,
+                transmission + float(tau_grid[index]),
+            )
+            prefix.pop()
+
+    search(start=0, remaining=n_channels, transmission=0.0)
+    if pending_progress:
+        progress_bar.update(pending_progress)
+    progress_bar.close()
     if not accepted:
         return np.empty((0, n_channels), dtype=np.int32)
     return np.asarray(accepted, dtype=np.int32)
+
+
+def _extend_current_bank(
+    V_mV: FloatArray,
+    currents_nA: FloatArray,
+    V_support_mV: FloatArray,
+    extrapolation_points: int,
+) -> FloatArray:
+    """Interpolate internally and linearly extrapolate both IV edges."""
+    count = min(int(extrapolation_points), V_mV.size)
+    if count < 2:
+        raise ValueError("at least two voltage points are required.")
+    extended = np.stack(
+        [np.interp(V_support_mV, V_mV, current) for current in currents_nA]
+    )
+
+    left_x = V_mV[:count]
+    left_centered = left_x - np.mean(left_x)
+    left_slopes = currents_nA[:, :count] @ left_centered / np.sum(left_centered**2)
+    left = V_support_mV < V_mV[0]
+    extended[:, left] = currents_nA[:, [0]] + left_slopes[:, None] * (
+        V_support_mV[left] - V_mV[0]
+    )
+
+    right_x = V_mV[-count:]
+    right_centered = right_x - np.mean(right_x)
+    right_slopes = currents_nA[:, -count:] @ right_centered / np.sum(right_centered**2)
+    right = V_support_mV > V_mV[-1]
+    extended[:, right] = currents_nA[:, [-1]] + right_slopes[:, None] * (
+        V_support_mV[right] - V_mV[-1]
+    )
+    return extended
 
 
 def _evaluate_mar_with_voltage_noise(
@@ -455,6 +692,7 @@ def _evaluate_mar_with_voltage_noise(
     Delta_meV: float,
     gamma_meV: float,
     sigmaV_mV: float,
+    extrapolation_points: int = 25,
 ) -> FloatArray:
     """Recalculate one complete pincode with padded voltage broadening."""
     if sigmaV_mV == 0.0:
@@ -470,15 +708,21 @@ def _evaluate_mar_with_voltage_noise(
             dtype=np.float64,
         )
 
-    V_support_mV = make_bias_support_grid(V_mV, sigmaV_mV)
-    I_support_nA = get_Imar_nA(
-        V_mV=V_support_mV,
+    I_nA = get_Imar_nA(
+        V_mV=V_mV,
         tau=tau,
         T_K=T_K,
         Delta_meV=Delta_meV,
         gamma_meV=gamma_meV,
         caching=True,
     )
+    V_support_mV = make_bias_support_grid(V_mV, sigmaV_mV)
+    I_support_nA = _extend_current_bank(
+        V_mV,
+        np.asarray(I_nA, dtype=np.float64)[None, :],
+        V_support_mV,
+        extrapolation_points,
+    )[0]
     broadened_support_nA = apply_voltage_noise(
         V_support_mV,
         np.asarray(I_support_nA, dtype=np.float64),
