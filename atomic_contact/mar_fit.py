@@ -433,7 +433,7 @@ def fit_mar_grid(
     *,
     n_channels: int,
     tau_sum_bounds: tuple[float, float] = (0.0, np.inf),
-    sigmaG_G0: ArrayLike | float | None = None,
+    weights: ArrayLike | float | None = None,
     voltage_bounds_mV: tuple[float, float] | None = None,
     T_K: float | None = None,
     Delta_meV: float | None = None,
@@ -447,10 +447,11 @@ def fit_mar_grid(
     """Search the full MAR, voltage-noise, and pincode grid.
 
     ``I_nA`` must already be mapped onto ``database.grid.V_mV``.  The fitted
-    quantity is ``I_nA / (V_mV * G0_muS)``.  Non-finite current or uncertainty
-    entries and zero voltage are ignored directly; no interpolation is
-    performed.  All combinations with replacement of ``n_channels`` are
-    tested, optionally restricted by total transmission.
+    objective is ``sum(weights * (I_model_nA - I_exp_nA)**2)``.  Non-finite
+    current entries and zero-weight samples are ignored directly; no
+    interpolation is performed.  ``weights`` may be a nonnegative scalar or
+    an array matching the voltage grid.  All combinations with replacement of
+    ``n_channels`` are tested, optionally restricted by total transmission.
 
     Voltage broadening is already precalculated along the grid's
     ``sigmaV_mV`` axis.  All pincodes are scored in batches.  Pass any of
@@ -483,12 +484,9 @@ def fit_mar_grid(
             "I_nA must be a 1D trace mapped onto database.grid.V_mV "
             f"with shape {grid.V_mV.shape}; got {I_data.shape}."
         )
-    sigma_data = _fit_uncertainty(sigmaG_G0, grid.V_mV.shape)
+    fit_weights = _fit_weights(weights, grid.V_mV.shape)
     fit_mask = (
-        np.isfinite(I_data)
-        & np.isfinite(sigma_data)
-        & (sigma_data > 0.0)
-        & (grid.V_mV != 0.0)
+        np.isfinite(I_data) & np.isfinite(fit_weights) & (fit_weights > 0.0)
     )
     if voltage_bounds_mV is not None:
         low, high = map(float, voltage_bounds_mV)
@@ -501,8 +499,7 @@ def fit_mar_grid(
             "fewer than two finite current samples lie in the fit window."
         )
     I_exp = I_data[fit_mask]
-    G_exp = I_exp / (V_fit * G0_muS)
-    sigma_G = sigma_data[fit_mask]
+    weights_fit = fit_weights[fit_mask]
 
     pincodes = generate_pincodes(
         grid.tau,
@@ -535,12 +532,11 @@ def fit_mar_grid(
     )
     for i_T, i_delta, i_gamma, i_sigma in global_indices:
         bank = database.I_nA[:, i_T, i_delta, i_gamma, i_sigma, :][:, fit_mask]
-        G_bank = bank / (V_fit[None, :] * G0_muS)
         chi2, i_pincode, current = _best_pincode(
-            G_bank,
+            bank,
             pincodes,
-            G_exp,
-            sigma_G,
+            I_exp,
+            weights_fit,
             batch_size,
             backend=backend,
             progress_bar=fit_progress,
@@ -795,7 +791,7 @@ def _best_pincode(
     bank: FloatArray,
     pincodes: IntArray,
     target: FloatArray,
-    sigma: FloatArray,
+    weights: FloatArray,
     batch_size: int,
     *,
     backend: FitBackend = "auto",
@@ -807,7 +803,7 @@ def _best_pincode(
             bank,
             pincodes,
             target,
-            sigma,
+            weights,
             batch_size,
             progress_bar,
         )
@@ -815,7 +811,7 @@ def _best_pincode(
         bank,
         pincodes,
         target,
-        sigma,
+        weights,
         batch_size,
         progress_bar,
     )
@@ -840,7 +836,7 @@ def _best_pincode_numpy(
     bank: FloatArray,
     pincodes: IntArray,
     target: FloatArray,
-    sigma: FloatArray,
+    weights: FloatArray,
     batch_size: int,
     progress_bar=None,
 ) -> tuple[float, int, FloatArray]:
@@ -855,8 +851,7 @@ def _best_pincode_numpy(
         for channel in range(batch.shape[1]):
             models += bank[batch[:, channel]]
         models -= target[None, :]
-        models /= sigma[None, :]
-        chi2 = np.einsum("ij,ij->i", models, models)
+        chi2 = np.einsum("ij,j,ij->i", models, weights, models)
         local = int(np.argmin(chi2))
         if chi2[local] < best_chi2:
             best_chi2 = float(chi2[local])
@@ -873,7 +868,7 @@ def _best_pincode_jax(
     bank: FloatArray,
     pincodes: IntArray,
     target: FloatArray,
-    sigma: FloatArray,
+    weights: FloatArray,
     batch_size: int,
     progress_bar=None,
 ) -> tuple[float, int, FloatArray]:
@@ -886,7 +881,7 @@ def _best_pincode_jax(
     dtype = jnp.float64 if jax.config.x64_enabled else jnp.float32
     bank_device = jax.device_put(np.asarray(bank, dtype=np.dtype(dtype)))
     target_device = jax.device_put(np.asarray(target, dtype=np.dtype(dtype)))
-    sigma_device = jax.device_put(np.asarray(sigma, dtype=np.dtype(dtype)))
+    weights_device = jax.device_put(np.asarray(weights, dtype=np.dtype(dtype)))
 
     batch_minimum = _jax_batch_minimum()
 
@@ -898,7 +893,7 @@ def _best_pincode_jax(
         chi2_device, local_device = batch_minimum(
             bank_device,
             target_device,
-            sigma_device,
+            weights_device,
             jax.device_put(batch),
         )
         chi2 = float(chi2_device)
@@ -922,31 +917,37 @@ def _jax_batch_minimum():
     import jax.numpy as jnp
 
     @jax.jit
-    def score(bank, target, sigma, indices):
+    def score(bank, target, weights, indices):
         models = jnp.sum(bank[indices], axis=1)
-        residuals = (models - target[None, :]) / sigma[None, :]
-        chi2 = jnp.sum(residuals * residuals, axis=1)
+        residuals = models - target[None, :]
+        chi2 = jnp.sum(weights[None, :] * residuals * residuals, axis=1)
         index = jnp.argmin(chi2)
         return chi2[index], index
 
     return score
 
 
-def _fit_uncertainty(
-    sigmaG_G0: ArrayLike | float | None,
+def _fit_weights(
+    weights: ArrayLike | float | None,
     shape: tuple[int, ...],
 ) -> FloatArray:
-    if sigmaG_G0 is None:
+    if weights is None:
         return np.ones(shape, dtype=np.float64)
-    sigma = np.asarray(sigmaG_G0, dtype=np.float64)
-    if sigma.ndim == 0:
-        sigma = np.full(shape, float(sigma), dtype=np.float64)
-    if sigma.shape != shape:
+    array = np.asarray(weights, dtype=np.float64)
+    if array.ndim == 0:
+        array = np.full(shape, float(array), dtype=np.float64)
+    if array.shape != shape:
         raise ValueError(
-            "sigmaG_G0 must be scalar or have the same shape as "
+            "weights must be scalar or have the same shape as "
             "database.grid.V_mV."
         )
-    return sigma
+    if np.any(~np.isfinite(array)):
+        raise ValueError("weights must be finite.")
+    if np.any(array < 0.0):
+        raise ValueError("weights must be nonnegative.")
+    if not np.any(array > 0.0):
+        raise ValueError("at least one weight must be positive.")
+    return array
 
 
 def _axis(
