@@ -27,6 +27,11 @@ from superconductivity.utilities.constants import G0_muS
 from tqdm.auto import tqdm
 
 FloatArray = NDArray[np.float64]
+TAU_NAMES = tuple(f"tau_{index}" for index in range(1, 10)) + (
+    "tau_A",
+    "tau_B",
+    "tau_C",
+)
 
 
 @dataclass(frozen=True)
@@ -264,9 +269,10 @@ def fit_mar_gradient(
     """Fit an MAR trace by discrete steepest descent on the loaded grid.
 
     ``settings`` uses the same ``(guess, lower, upper, fixed)`` tuples as the
-    BCS fit helpers.  It must define ``tau_1`` through ``tau_9``, ``T_K``,
-    ``Delta_meV``, ``gamma_meV``, and ``sigmaV_mV``.  Disable an unused channel
-    with ``(0.0, 0.0, 0.0, True)``.  Every value and bound is mapped onto the
+    BCS fit helpers.  It must define ``tau_1`` through ``tau_9``, ``tau_A``,
+    ``tau_B``, ``tau_C``, ``T_K``, ``Delta_meV``, ``gamma_meV``, and
+    ``sigmaV_mV``.  Disable an unused channel with
+    ``(0.0, 0.0, 0.0, True)``.  Every value and bound is mapped onto the
     corresponding loaded grid axis.
 
     ``weights`` are arbitrary nonnegative point weights in the current-space
@@ -286,7 +292,7 @@ def fit_mar_gradient(
     Increasing ``restarts`` trades additional work for greater robustness.
     """
     start = perf_counter()
-    tau_names = tuple(f"tau_{index}" for index in range(1, 10))
+    tau_names = TAU_NAMES
     global_names = ("T_K", "Delta_meV", "gamma_meV", "sigmaV_mV")
     missing = [
         name for name in tau_names + global_names if name not in settings
