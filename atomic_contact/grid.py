@@ -1,4 +1,6 @@
 # prepare database
+import pickle
+
 import numpy as np
 from mar_fit import MARGrid, prepare_mar_database
 
@@ -8,7 +10,9 @@ grid = MARGrid(
     T_K=0.0,
     Delta_meV=np.linspace(0.187, 0.191, 9),
     gamma_meV=1e-6,
-    # sigmaV_mV=np.linspace(0, 0.05, 51),
-    sigmaV_mV=0,
+    sigmaV_mV=np.linspace(0, 0.05, 101),
 )
 database = prepare_mar_database(grid)
+
+with open("grid.pkl", "wb") as f:
+    pickle.dump(database, f)
