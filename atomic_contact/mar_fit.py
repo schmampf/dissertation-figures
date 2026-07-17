@@ -1,23 +1,21 @@
-"""Cached grid fitting for atomic-contact multiple Andreev reflection.
+"""Local steepest-descent fitting for atomic-contact MAR traces.
 
-The expensive, unbroadened single-channel MAR currents are obtained as:
-
-``I[tau, T, Delta, gamma, sigmaV, V]``.
-
-``get_Imar_nA(..., caching=True)`` owns persistence in the shared native MAR
-HDF5 cache.  This module assembles the requested curves into a dense in-memory
-array and precalculates voltage-noise broadening from them.  ``sigmaV_mV`` is
-therefore a fit-grid dimension, but not a native HDF5-cache dimension.
+The fitter walks on a discrete MAR grid, evaluates the immediate neighbours
+of the current solution, and accepts the move with the largest decrease in
+chi squared. Optional independent restarts make the local search less
+sensitive to its starting point.
 """
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from functools import lru_cache
-from itertools import product
-from math import comb
+from os import PathLike
+from pathlib import Path
+import pickle
 from time import perf_counter
-from typing import Literal
+from typing import Mapping
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -26,40 +24,81 @@ from superconductivity.models.basics.noise import (
     make_bias_support_grid,
 )
 from superconductivity.models.mar import get_Imar_nA
-from superconductivity.models.mar.core import (
-    SymmetricHAParams,
-    quantize_voltage_mV,
-)
-from superconductivity.models.mar.core.cache import locked_h5_file
-from superconductivity.models.mar.models.ha_sym import (
-    CACHE_FILE as HA_SYM_CACHE_FILE,
-)
-from superconductivity.models.mar.models.ha_sym import (
-    CACHE_ROOT_GROUP as HA_SYM_CACHE_ROOT,
-)
 from superconductivity.utilities.constants import G0_muS
 from tqdm.auto import tqdm
 
 FloatArray = NDArray[np.float64]
-IntArray = NDArray[np.int32]
-FitBackend = Literal["auto", "jax", "numpy"]
+TAU_NAMES = tuple(f"tau_{index}" for index in range(1, 10)) + (
+    "tau_A",
+    "tau_B",
+    "tau_C",
+)
+State = tuple[int, ...]
+
+
+class _ModelCurrentCache:
+    """Bounded LRU cache for summed model currents."""
+
+    def __init__(self, maxsize: int) -> None:
+        if maxsize < 0:
+            raise ValueError("model_cache_size must be nonnegative.")
+        self.maxsize = maxsize
+        self._values: OrderedDict[State, FloatArray] = OrderedDict()
+
+    def get_many(
+        self,
+        states: list[State],
+        currents: FloatArray,
+        n_channels: int,
+    ) -> FloatArray:
+        """Return models, calculating missing states in vectorized groups."""
+        models = np.empty((len(states), currents.shape[-1]), dtype=np.float64)
+        missing_by_global: dict[tuple[int, ...], list[tuple[int, State]]] = {}
+        for position, state in enumerate(states):
+            cached = self._values.get(state)
+            if cached is not None:
+                self._values.move_to_end(state)
+                models[position] = cached
+                continue
+            global_state = state[n_channels:]
+            missing_by_global.setdefault(global_state, []).append(
+                (position, state)
+            )
+
+        for global_state, missing in missing_by_global.items():
+            tau_indices = np.asarray(
+                [state[:n_channels] for _, state in missing],
+                dtype=np.intp,
+            )
+            i_T, i_delta, i_gamma, i_sigma = global_state
+            calculated = np.sum(
+                currents[
+                    tau_indices,
+                    i_T,
+                    i_delta,
+                    i_gamma,
+                    i_sigma,
+                ],
+                axis=1,
+            )
+            for row, (position, state) in enumerate(missing):
+                model = calculated[row]
+                models[position] = model
+                self._store(state, model)
+        return models
+
+    def _store(self, state: State, model: FloatArray) -> None:
+        if self.maxsize == 0:
+            return
+        self._values[state] = model.copy()
+        self._values.move_to_end(state)
+        while len(self._values) > self.maxsize:
+            self._values.popitem(last=False)
 
 
 @dataclass(frozen=True)
 class MARGrid:
-    """Axes of the in-memory MAR current bank.
-
-    Parameters
-    ----------
-    V_mV
-        Arbitrarily spaced, strictly increasing voltage grid.  Include
-        sufficient voltage range for the fit; sigma broadening uses only the
-        available support at the database boundaries.
-    tau, T_K, Delta_meV, gamma_meV, sigmaV_mV
-        Arbitrarily spaced single-channel MAR parameter axes.  They are
-        sorted, rounded to the native MAR-cache precision, and deduplicated.
-        One-point axes are allowed.
-    """
+    """Axes of a single-channel MAR current database."""
 
     V_mV: FloatArray
     tau: FloatArray
@@ -104,7 +143,7 @@ class MARGrid:
 
     @property
     def current_shape(self) -> tuple[int, ...]:
-        """Shape of the cached current array."""
+        """Shape of the current bank."""
         return (
             self.tau.size,
             self.T_K.size,
@@ -117,7 +156,7 @@ class MARGrid:
 
 @dataclass(frozen=True)
 class MARDatabase:
-    """A voltage-broadened single-channel MAR current bank and its grid."""
+    """Voltage-broadened single-channel MAR currents and their grid."""
 
     grid: MARGrid
     I_nA: FloatArray
@@ -126,149 +165,77 @@ class MARDatabase:
 
 
 @dataclass(frozen=True)
-class MARGridFitResult:
-    """Best point in a complete pincode and global-parameter grid search."""
+class MARFitResult:
+    """Result of a local, discrete steepest-descent MAR fit."""
 
     tau: FloatArray
     T_K: float
     Delta_meV: float
     gamma_meV: float
     sigmaV_mV: float
+    parameter_values: dict[str, float]
     chi2: float
     reduced_chi2: float
     V_mV: FloatArray
     I_exp_nA: FloatArray
     Ifit_nA: FloatArray
     residual_nA: FloatArray
-    pincode_index: int
     parameter_index: tuple[int, int, int, int]
-    pincodes_tested: int
-    grid_points_tested: int
+    candidates_tested: int
+    iterations: int
+    restarts: int
+    converged: bool
     fitting_time_s: float
 
 
-def _bulk_read_mar_cache(
-    V_mV: FloatArray,
-    grid: MARGrid,
-    output: FloatArray,
-    parameter_indices: list[tuple[int, ...]],
-    *,
-    desc: str,
-    progress: bool,
-) -> list[tuple[int, ...]]:
-    """Fill complete symmetric-HA curves during one HDF5 session."""
-    nonzero = V_mV != 0.0
-    V_lookup_q = quantize_voltage_mV(np.abs(V_mV[nonzero]))
-    missing = []
-    iterator = tqdm(
-        parameter_indices,
-        desc=desc,
-        unit="curve",
-        disable=not progress,
-    )
-    with locked_h5_file(HA_SYM_CACHE_FILE, "a") as handle:
-        for indices in iterator:
-            i_tau, i_T, i_delta, i_gamma = indices
-            tau = float(grid.tau[i_tau])
-            if tau == 0.0:
-                output[indices] = 0.0
-                continue
-
-            params = SymmetricHAParams.from_raw(
-                tau=tau,
-                T_K=float(grid.T_K[i_T]),
-                Delta_meV=float(grid.Delta_meV[i_delta]),
-                gamma_meV=float(grid.gamma_meV[i_gamma]),
-                gamma_meV_min=1.0e-4,
-            )
-            group_path = f"{HA_SYM_CACHE_ROOT}/{params.cache_key()}"
-            if group_path not in handle:
-                missing.append(indices)
-                continue
-
-            group = handle[group_path]
-            V_cached_q = np.asarray(group["V_q"][...], dtype=np.int64)
-            I_cached_nA = np.asarray(group["I_nA"][...], dtype=np.float64)
-            positions = np.searchsorted(V_cached_q, V_lookup_q)
-            complete = np.all(positions < V_cached_q.size)
-            if complete:
-                complete = np.array_equal(
-                    V_cached_q[positions],
-                    V_lookup_q,
-                )
-            if not complete:
-                missing.append(indices)
-                continue
-
-            current = np.zeros_like(V_mV)
-            current[nonzero] = np.sign(V_mV[nonzero]) * I_cached_nA[positions]
-            output[indices] = current
-    return missing
-
-
 def prepare_mar_trace(
-    V_mV,
-    I_nA,
-    Vnan_mV=0.03,
-):
-    """Return a fit mask and estimate GN/G0 from the outer IV plateaus."""
-    V_mV = np.asarray(V_mV, dtype=np.float64)
-    I_nA = np.asarray(I_nA, dtype=np.float64)
-
-    if V_mV.shape != I_nA.shape:
+    V_mV: ArrayLike,
+    I_nA: ArrayLike,
+    Vnan_mV: float = 0.03,
+) -> NDArray[np.bool_]:
+    """Return a mask excluding non-finite data and the zero-bias region."""
+    voltage = np.asarray(V_mV, dtype=np.float64)
+    current = np.asarray(I_nA, dtype=np.float64)
+    if voltage.shape != current.shape:
         raise ValueError("V_mV and I_nA must have the same shape.")
-
-    finite = np.isfinite(V_mV) & np.isfinite(I_nA)
-    mask = finite & (np.abs(V_mV) > Vnan_mV)
-    return mask
+    return (
+        np.isfinite(voltage)
+        & np.isfinite(current)
+        & (np.abs(voltage) > Vnan_mV)
+    )
 
 
 def estimate_GN_bounds(
-    V_mV,
-    I_nA,
-    VGN_mV=0.5,
-    n_sections=4,
-    confidence=2.0,
-):
-    V_mV = np.asarray(V_mV, dtype=np.float64)
-    I_nA = np.asarray(I_nA, dtype=np.float64)
-
-    finite = np.isfinite(V_mV) & np.isfinite(I_nA)
-    slopes_G0 = []
-
+    V_mV: ArrayLike,
+    I_nA: ArrayLike,
+    VGN_mV: float = 0.5,
+    n_sections: int = 4,
+    confidence: float = 2.0,
+) -> tuple[float, tuple[float, float]]:
+    """Estimate normal conductance and robust bounds from IV plateaus."""
+    voltage = np.asarray(V_mV, dtype=np.float64)
+    current = np.asarray(I_nA, dtype=np.float64)
+    if voltage.shape != current.shape:
+        raise ValueError("V_mV and I_nA must have the same shape.")
+    finite = np.isfinite(voltage) & np.isfinite(current)
+    slopes = []
     for polarity in (-1, 1):
-        select = finite & (polarity * V_mV >= VGN_mV)
-        indices = np.flatnonzero(select)
-
+        indices = np.flatnonzero(finite & (polarity * voltage >= VGN_mV))
         for section in np.array_split(indices, n_sections):
-            if section.size < 2:
-                continue
-
-            slope_uS, _ = np.polyfit(
-                V_mV[section],
-                I_nA[section],
-                deg=1,
-            )
-            slopes_G0.append(slope_uS / G0_muS)
-
-    if len(slopes_G0) < 2:
+            if section.size >= 2:
+                slope_uS, _ = np.polyfit(
+                    voltage[section],
+                    current[section],
+                    deg=1,
+                )
+                slopes.append(slope_uS / G0_muS)
+    if len(slopes) < 2:
         raise ValueError("Not enough plateau sections to estimate bounds.")
-
-    slopes_G0 = np.asarray(slopes_G0)
-    GN_G0 = float(np.median(slopes_G0))
-
-    sigma_GN_G0 = float(1.4826 * np.median(np.abs(slopes_G0 - GN_G0)))
-    delta_GN_G0 = max(
-        confidence * sigma_GN_G0,
-        0.02 * GN_G0,
-        0.02,
-    )
-
-    bounds = (
-        max(0.0, GN_G0 - delta_GN_G0),
-        GN_G0 + delta_GN_G0,
-    )
-    return GN_G0, bounds
+    values = np.asarray(slopes)
+    conductance = float(np.median(values))
+    spread = float(1.4826 * np.median(np.abs(values - conductance)))
+    margin = max(confidence * spread, 0.02 * conductance, 0.02)
+    return conductance, (max(0.0, conductance - margin), conductance + margin)
 
 
 def prepare_mar_database(
@@ -277,57 +244,25 @@ def prepare_mar_database(
     extrapolation_points: int = 25,
     progress: bool = True,
 ) -> MARDatabase:
-    """Assemble a dense grid using the native MAR cache.
+    """Calculate and broaden the single-channel curves needed by ``grid``.
 
-    Every call to :func:`get_Imar_nA` uses ``caching=True``.  The MAR frontend
-    checks its shared HDF5 cache for the parameter tuple and requested voltage
-    points, evaluates only missing points, and merges them into that cache.
-    Consequently, this function does not create or manage another cache.
-
-    Parameters
-    ----------
-    grid
-        Requested voltage and MAR parameter axes.
-    extrapolation_points
-        Number of points at each voltage edge used to linearly extrapolate
-        the IV onto the Gaussian-convolution padding.  This avoids expensive
-        MAR calculations outside ``grid.V_mV``.
-    progress
-        Show a notebook-aware progress bar while loading the grid.
+    Native MAR caching remains enabled, so curves already present in the
+    package cache are reused.  This function creates no second disk cache.
     """
-    V_support_mV = make_bias_support_grid(
-        grid.V_mV,
-        float(np.max(grid.sigmaV_mV)),
-    )
     if extrapolation_points < 2:
         raise ValueError("extrapolation_points must be at least two.")
-    base_shape = (
-        grid.tau.size,
-        grid.T_K.size,
-        grid.Delta_meV.size,
-        grid.gamma_meV.size,
-        grid.V_mV.size,
-    )
-    base_I_nA = np.full(base_shape, np.nan, dtype=np.float64)
+    base_shape = grid.current_shape[:-2] + (grid.V_mV.size,)
+    base = np.empty(base_shape, dtype=np.float64)
     parameter_indices = list(np.ndindex(base_shape[:-1]))
-    total = len(parameter_indices)
     start = perf_counter()
-    missing = _bulk_read_mar_cache(
-        grid.V_mV,
-        grid,
-        base_I_nA,
-        parameter_indices,
-        desc="MAR cache read",
-        progress=progress,
-    )
     iterator = tqdm(
-        missing,
-        desc="Missing MAR curves",
+        parameter_indices,
+        desc="MAR curves",
         unit="curve",
-        disable=not progress or not missing,
+        disable=not progress,
     )
     for i_tau, i_T, i_delta, i_gamma in iterator:
-        base_I_nA[i_tau, i_T, i_delta, i_gamma] = get_Imar_nA(
+        base[i_tau, i_T, i_delta, i_gamma] = get_Imar_nA(
             V_mV=grid.V_mV,
             tau=float(grid.tau[i_tau]),
             T_K=float(grid.T_K[i_T]),
@@ -335,19 +270,12 @@ def prepare_mar_database(
             gamma_meV=float(grid.gamma_meV[i_gamma]),
             caching=True,
         )
-    if missing:
-        _bulk_read_mar_cache(
-            grid.V_mV,
-            grid,
-            base_I_nA,
-            parameter_indices,
-            desc="MAR cache reread",
-            progress=progress,
-        )
-    if not np.all(np.isfinite(base_I_nA)):
-        raise RuntimeError("MAR cache remains incomplete after calculation.")
 
-    I_nA = np.empty(grid.current_shape, dtype=np.float64)
+    output = np.empty(grid.current_shape, dtype=np.float64)
+    support = make_bias_support_grid(
+        grid.V_mV,
+        float(np.max(grid.sigmaV_mV)),
+    )
     global_indices = list(
         np.ndindex(
             grid.T_K.size,
@@ -355,576 +283,609 @@ def prepare_mar_database(
             grid.gamma_meV.size,
         )
     )
-    broadening_progress = tqdm(
-        total=len(global_indices) * grid.sigmaV_mV.size,
+    iterator = tqdm(
+        global_indices,
         desc="Voltage noise",
         unit="bank",
         disable=not progress,
     )
-    for i_T, i_delta, i_gamma in global_indices:
-        base_bank = base_I_nA[:, i_T, i_delta, i_gamma, :]
-        support_bank = _extend_current_bank(
+    for i_T, i_delta, i_gamma in iterator:
+        bank = base[:, i_T, i_delta, i_gamma]
+        extended = _extend_current_bank(
             grid.V_mV,
-            base_bank,
-            V_support_mV,
+            bank,
+            support,
             extrapolation_points,
         )
         for i_sigma, sigma in enumerate(grid.sigmaV_mV):
-            for i_tau in range(grid.tau.size):
-                if sigma == 0.0:
-                    I_nA[i_tau, i_T, i_delta, i_gamma, i_sigma, :] = base_bank[
-                        i_tau
-                    ]
-                    continue
-                broadened_support = apply_voltage_noise(
-                    V_support_mV,
-                    support_bank[i_tau],
+            if sigma == 0.0:
+                output[:, i_T, i_delta, i_gamma, i_sigma] = bank
+                continue
+            for i_tau, current in enumerate(extended):
+                broadened = apply_voltage_noise(
+                    support,
+                    current,
                     float(sigma),
                     order=32,
                 )
-                I_nA[i_tau, i_T, i_delta, i_gamma, i_sigma, :] = np.interp(
+                output[i_tau, i_T, i_delta, i_gamma, i_sigma] = np.interp(
                     grid.V_mV,
-                    V_support_mV,
-                    broadened_support,
+                    support,
+                    broadened,
                 )
-            broadening_progress.update(1)
-    broadening_progress.close()
-
-    elapsed = perf_counter() - start
     return MARDatabase(
         grid=grid,
-        I_nA=I_nA,
-        curves_requested=total,
-        loading_time_s=elapsed,
+        I_nA=output,
+        curves_requested=len(parameter_indices),
+        loading_time_s=perf_counter() - start,
     )
 
 
-def _selected_grid_indices(
-    axis: FloatArray,
-    fixed_value: float | None,
-    name: str,
-) -> NDArray[np.int64]:
-    """Return all indices or the index of one existing grid value."""
-    if fixed_value is None:
-        return np.arange(axis.size, dtype=np.int64)
-    value = float(fixed_value)
-    if not np.isfinite(value):
-        raise ValueError(f"{name} must be finite when fixed.")
-    matches = np.flatnonzero(
-        np.isclose(
-            axis,
-            value,
-            rtol=0.0,
-            atol=np.finfo(np.float64).eps * max(1.0, abs(value)) * 8.0,
-        )
-    )
-    if matches.size == 0:
-        nearest = int(np.argmin(np.abs(axis - value)))
-        raise ValueError(
-            f"fixed {name}={value!r} is not in the loaded MAR grid; "
-            f"nearest available value is {float(axis[nearest])!r}."
-        )
-    return np.asarray([matches[0]], dtype=np.int64)
-
-
-def fit_mar_grid(
+def fit_mar(
     I_nA: ArrayLike,
-    database: MARDatabase,
+    database: MARDatabase | str | PathLike[str],
     *,
-    n_channels: int,
+    settings: Mapping[str, tuple[float, float, float, bool]],
     tau_sum_bounds: tuple[float, float] = (0.0, np.inf),
     weights: ArrayLike | float | None = None,
     voltage_bounds_mV: tuple[float, float] | None = None,
-    T_K: float | None = None,
-    Delta_meV: float | None = None,
-    Delta_mev: float | None = None,
-    gamma_meV: float | None = None,
-    sigmaV_mV: float | None = None,
-    batch_size: int = 50_000,
-    backend: FitBackend = "auto",
+    restarts: int = 4,
+    max_iterations: int = 500,
+    random_seed: int | None = 0,
     progress: bool = True,
-) -> MARGridFitResult:
-    """Search the full MAR, voltage-noise, and pincode grid.
+    warm_start: bool = True,
+    model_cache_size: int = 4096,
+) -> MARFitResult | list[MARFitResult]:
+    """Fit one MAR trace or a batch of traces.
 
-    ``I_nA`` must already be mapped onto ``database.grid.V_mV``.  The fitted
-    objective is ``sum(weights * (I_model_nA - I_exp_nA)**2)``.  Non-finite
-    current entries and zero-weight samples are ignored directly; no
-    interpolation is performed.  ``weights`` may be a nonnegative scalar or
-    an array matching the voltage grid.  All combinations with replacement of
-    ``n_channels`` are tested, optionally restricted by total transmission.
+    A one-dimensional input returns one :class:`MARFitResult`. A
+    two-dimensional input with shape ``(n_traces, n_voltage)`` returns one
+    result per row in a list. ``weights`` may be scalar, shared across all
+    traces with shape ``(n_voltage,)``, or trace-specific with the same shape
+    as a two-dimensional ``I_nA`` input.
 
-    Voltage broadening is already precalculated along the grid's
-    ``sigmaV_mV`` axis.  All pincodes are scored in batches.  Pass any of
-    ``T_K``, ``Delta_meV`` (or ``Delta_mev``), ``gamma_meV``, and
-    ``sigmaV_mV`` to restrict that parameter to an already-loaded grid value.
-    The database is neither reloaded nor recalculated.  ``backend="auto"``
-    uses JAX when it is installed and falls back to memory-bounded NumPy.
-    The JAX scorer keeps the large model and residual arrays inside the
-    compiled calculation and transfers only each batch's minimum back to
-    Python.
+    ``database`` may be an already loaded :class:`MARDatabase` or the path to
+    its pickle file, for example ``"grid.pkl"``. A file is loaded only once
+    per call, including batch fits.
+
+    With ``warm_start=True``, each batch result supplies the guesses for the
+    next trace while bounds and ``fixed`` flags remain unchanged. Random
+    starts are reproducible but independent between traces when
+    ``random_seed`` is not ``None``. ``model_cache_size`` bounds the number of
+    summed model IVs shared by all traces in this call. With 1,801 voltage
+    points, the default occupies at most about 59 MiB plus dictionary
+    overhead.
     """
-    if n_channels < 1:
-        raise ValueError("n_channels must be at least one.")
-    if batch_size < 1:
-        raise ValueError("batch_size must be at least one.")
-    if backend not in ("auto", "jax", "numpy"):
-        raise ValueError("backend must be 'auto', 'jax', or 'numpy'.")
-    grid = database.grid
-    if database.I_nA.shape != grid.current_shape:
-        raise ValueError("database current shape does not match its grid.")
-    if not np.all(np.isfinite(database.I_nA)):
-        raise ValueError("database contains missing or non-finite IVs.")
-    if Delta_meV is not None and Delta_mev is not None:
-        raise ValueError("pass only one of Delta_meV and Delta_mev.")
-    fixed_delta_meV = Delta_meV if Delta_meV is not None else Delta_mev
-
-    I_data = np.asarray(I_nA, dtype=np.float64)
-    if I_data.shape != grid.V_mV.shape:
-        raise ValueError(
-            "I_nA must be a 1D trace mapped onto database.grid.V_mV "
-            f"with shape {grid.V_mV.shape}; got {I_data.shape}."
+    database = _load_mar_database(database)
+    model_cache = _ModelCurrentCache(model_cache_size)
+    data = np.asarray(I_nA, dtype=np.float64)
+    if data.ndim == 1:
+        return _fit_mar_trace(
+            data,
+            database,
+            settings=settings,
+            tau_sum_bounds=tau_sum_bounds,
+            weights=weights,
+            voltage_bounds_mV=voltage_bounds_mV,
+            restarts=restarts,
+            max_iterations=max_iterations,
+            random_seed=random_seed,
+            progress=progress,
+            model_cache=model_cache,
         )
-    fit_weights = _fit_weights(weights, grid.V_mV.shape)
+    if data.ndim != 2:
+        raise ValueError("I_nA must be one- or two-dimensional.")
+    if data.shape[1:] != database.grid.V_mV.shape:
+        raise ValueError(
+            "each I_nA trace must have the same shape as grid.V_mV."
+        )
+
+    fit_weights = weights
+    weights_array: NDArray[np.float64] | None = None
+    if weights is not None:
+        candidate = np.asarray(weights, dtype=np.float64)
+        if candidate.ndim == 2:
+            if candidate.shape != data.shape:
+                raise ValueError(
+                    "two-dimensional weights must have the same shape as "
+                    "I_nA."
+                )
+            weights_array = candidate
+
+    trace_seeds = (
+        [
+            int(child.generate_state(1)[0])
+            for child in np.random.SeedSequence(random_seed).spawn(
+                data.shape[0]
+            )
+        ]
+        if random_seed is not None
+        else [None] * data.shape[0]
+    )
+    results = []
+    current_settings = dict(settings)
+    iterator = tqdm(
+        range(data.shape[0]),
+        desc="MAR traces",
+        unit="trace",
+        disable=not progress,
+    )
+    for index in iterator:
+        trace_seed = trace_seeds[index]
+        result = _fit_mar_trace(
+            data[index],
+            database,
+            settings=current_settings,
+            tau_sum_bounds=tau_sum_bounds,
+            weights=(
+                weights_array[index]
+                if weights_array is not None
+                else fit_weights
+            ),
+            voltage_bounds_mV=voltage_bounds_mV,
+            restarts=restarts,
+            max_iterations=max_iterations,
+            random_seed=trace_seed,
+            progress=False,
+            model_cache=model_cache,
+        )
+        results.append(result)
+        if warm_start:
+            current_settings = {
+                name: (
+                    result.parameter_values.get(name, guess),
+                    lower,
+                    upper,
+                    fixed,
+                )
+                for name, (
+                    guess,
+                    lower,
+                    upper,
+                    fixed,
+                ) in current_settings.items()
+            }
+    return results
+
+
+def _load_mar_database(
+    database: MARDatabase | str | PathLike[str],
+) -> MARDatabase:
+    """Return a database, reusing pickle loads within the Python process."""
+    if isinstance(database, MARDatabase):
+        return database
+    if not isinstance(database, (str, PathLike)):
+        raise TypeError("database must be a MARDatabase or pickle path.")
+    path = Path(database).expanduser().resolve()
+    stat = path.stat()
+    return _load_pickled_mar_database(
+        str(path),
+        stat.st_mtime_ns,
+        stat.st_size,
+    )
+
+
+@lru_cache(maxsize=2)
+def _load_pickled_mar_database(
+    path: str,
+    modification_time_ns: int,
+    size: int,
+) -> MARDatabase:
+    """Load one version of a database pickle.
+
+    The file metadata forms part of the cache key so replacing ``grid.pkl``
+    invalidates the cached value automatically.
+    """
+    del modification_time_ns, size
+    with open(path, "rb") as handle:
+        loaded = pickle.load(handle)
+    if not isinstance(loaded, MARDatabase):
+        raise TypeError("the pickle file does not contain a MARDatabase.")
+    return loaded
+
+
+def clear_mar_database_cache() -> None:
+    """Release all databases loaded from pickle paths by :func:`fit_mar`."""
+    _load_pickled_mar_database.cache_clear()
+
+
+def _fit_mar_trace(
+    I_nA: ArrayLike,
+    database: MARDatabase,
+    *,
+    settings: Mapping[str, tuple[float, float, float, bool]],
+    tau_sum_bounds: tuple[float, float] = (0.0, np.inf),
+    weights: ArrayLike | float | None = None,
+    voltage_bounds_mV: tuple[float, float] | None = None,
+    restarts: int = 4,
+    max_iterations: int = 500,
+    random_seed: int | None = 0,
+    progress: bool = True,
+    model_cache: _ModelCurrentCache | None = None,
+) -> MARFitResult:
+    """Fit an MAR trace by discrete steepest descent on the loaded grid.
+
+    ``settings`` uses the same ``(guess, lower, upper, fixed)`` tuples as the
+    BCS fit helpers.  It must define ``tau_1`` through ``tau_9``, ``tau_A``,
+    ``tau_B``, ``tau_C``, ``T_K``, ``Delta_meV``, ``gamma_meV``, and
+    ``sigmaV_mV``.  Disable an unused channel with
+    ``(0.0, 0.0, 0.0, True)``.  Every value and bound is mapped onto the
+    corresponding loaded grid axis.
+
+    ``weights`` are arbitrary nonnegative point weights in the current-space
+    objective ``sum(weights * (I_model_nA - I_exp_nA)**2)``.  A scalar is
+    broadcast, zero-weight samples are excluded, and ``None`` gives equal
+    weighting.
+
+    At every iteration, each non-fixed parameter is moved by one allowed grid
+    point in either direction.  The valid move giving the largest chi-squared
+    reduction is accepted.  The first run uses the supplied guesses;
+    subsequent runs use random values inside the supplied bounds.
+
+    Notes
+    -----
+    This is a local optimizer.  It usually evaluates far fewer candidates than
+    an exhaustive pincode search, but it does not guarantee the global minimum.
+    Increasing ``restarts`` trades additional work for greater robustness.
+    """
+    start = perf_counter()
+    tau_names = TAU_NAMES
+    global_names = ("T_K", "Delta_meV", "gamma_meV", "sigmaV_mV")
+    missing = [
+        name for name in tau_names + global_names if name not in settings
+    ]
+    if missing:
+        raise KeyError(f"Missing fit settings for {', '.join(missing)}.")
+    n_channels = len(tau_names)
+    if restarts < 0:
+        raise ValueError("restarts must be nonnegative.")
+    if max_iterations < 1:
+        raise ValueError("max_iterations must be at least one.")
+    grid = database.grid
+    currents = np.asarray(database.I_nA, dtype=np.float64)
+    if currents.shape != grid.current_shape:
+        raise ValueError("database current shape does not match its grid.")
+    if model_cache is None:
+        model_cache = _ModelCurrentCache(0)
+
+    data = np.asarray(I_nA, dtype=np.float64)
+    if data.shape != grid.V_mV.shape:
+        raise ValueError("I_nA must have the same shape as grid.V_mV.")
+    fit_weights = _fit_weights(weights, data.shape)
     fit_mask = (
-        np.isfinite(I_data) & np.isfinite(fit_weights) & (fit_weights > 0.0)
+        np.isfinite(data) & np.isfinite(fit_weights) & (fit_weights > 0.0)
     )
     if voltage_bounds_mV is not None:
         low, high = map(float, voltage_bounds_mV)
         if low >= high:
             raise ValueError("voltage_bounds_mV must satisfy low < high.")
         fit_mask &= (grid.V_mV >= low) & (grid.V_mV <= high)
-    V_fit = grid.V_mV[fit_mask]
-    if V_fit.size < 2:
-        raise ValueError(
-            "fewer than two finite current samples lie in the fit window."
+    if np.count_nonzero(fit_mask) < 2:
+        raise ValueError("fewer than two samples are available for fitting.")
+
+    lower, upper = map(float, tau_sum_bounds)
+    if lower > upper:
+        raise ValueError("tau_sum_bounds must satisfy lower <= upper.")
+    tau_selected_and_start = tuple(
+        _settings_indices(grid.tau, settings[name], name) for name in tau_names
+    )
+    tau_selected = tuple(item[0] for item in tau_selected_and_start)
+    tau_start = tuple(item[1] for item in tau_selected_and_start)
+    global_selected_and_start = tuple(
+        _settings_indices(axis, settings[name], name)
+        for axis, name in zip(
+            (grid.T_K, grid.Delta_meV, grid.gamma_meV, grid.sigmaV_mV),
+            global_names,
+            strict=True,
         )
-    I_exp = I_data[fit_mask]
+    )
+    global_selected = tuple(item[0] for item in global_selected_and_start)
+    global_start = tuple(item[1] for item in global_selected_and_start)
+    minimum_sum = sum(float(grid.tau[indices[0]]) for indices in tau_selected)
+    maximum_sum = sum(float(grid.tau[indices[-1]]) for indices in tau_selected)
+    if maximum_sum < lower or minimum_sum > upper:
+        raise ValueError("tau_sum_bounds conflict with the channel bounds.")
+    target = data[fit_mask]
     weights_fit = fit_weights[fit_mask]
+    score_cache: dict[State, float] = {}
 
-    pincodes = generate_pincodes(
-        grid.tau,
-        n_channels,
-        tau_sum_bounds=tau_sum_bounds,
-        progress=progress,
+    def score_many(states: list[State]) -> FloatArray:
+        missing = [state for state in states if state not in score_cache]
+        if missing:
+            models = model_cache.get_many(missing, currents, n_channels)
+            residuals = models[:, fit_mask] - target
+            values = np.einsum(
+                "ij,j,ij->i",
+                residuals,
+                weights_fit,
+                residuals,
+                optimize=True,
+            )
+            score_cache.update(
+                (state, float(value))
+                for state, value in zip(missing, values, strict=True)
+            )
+        return np.asarray([score_cache[state] for state in states])
+
+    def score(state: State) -> float:
+        return float(score_many([state])[0])
+
+    rng = np.random.default_rng(random_seed)
+    projected = _project_tau_indices(
+        tau_start, grid.tau, tau_selected, lower, upper
     )
-    if pincodes.shape[0] == 0:
-        raise ValueError("no pincodes satisfy tau_sum_bounds.")
+    if projected is None:
+        raise ValueError(
+            "the tau guesses cannot be moved into tau_sum_bounds."
+        )
+    starts = [(projected, global_start)]
+    for _ in range(restarts):
+        random_tau = tuple(
+            int(rng.choice(indices)) for indices in tau_selected
+        )
+        random_tau = _project_tau_indices(
+            random_tau, grid.tau, tau_selected, lower, upper
+        )
+        if random_tau is None:
+            continue
+        random_global = tuple(
+            int(rng.choice(indices)) for indices in global_selected
+        )
+        starts.append((random_tau, random_global))
 
+    best_state: tuple[int, ...] | None = None
     best_chi2 = np.inf
-    best_indices: tuple[int, int, int, int, int] | None = None
-    best_current: FloatArray | None = None
-    start = perf_counter()
-    parameter_indices = (
-        _selected_grid_indices(grid.T_K, T_K, "T_K"),
-        _selected_grid_indices(grid.Delta_meV, fixed_delta_meV, "Delta_meV"),
-        _selected_grid_indices(grid.gamma_meV, gamma_meV, "gamma_meV"),
-        _selected_grid_indices(grid.sigmaV_mV, sigmaV_mV, "sigmaV_mV"),
-    )
-    total_global = int(
-        np.prod([indices.size for indices in parameter_indices])
-    )
-    global_indices = product(*parameter_indices)
-    fit_progress = tqdm(
-        total=total_global * pincodes.shape[0],
-        desc="MAR fit",
-        unit="candidate",
+    total_iterations = 0
+    all_converged = True
+    run_progress = tqdm(
+        starts,
+        desc="MAR gradient fit",
+        unit="start",
         disable=not progress,
     )
-    for i_T, i_delta, i_gamma, i_sigma in global_indices:
-        bank = database.I_nA[:, i_T, i_delta, i_gamma, i_sigma, :][:, fit_mask]
-        chi2, i_pincode, current = _best_pincode(
-            bank,
-            pincodes,
-            I_exp,
-            weights_fit,
-            batch_size,
-            backend=backend,
-            progress_bar=fit_progress,
-        )
-        if chi2 < best_chi2:
-            best_chi2 = chi2
-            best_indices = (
-                i_T,
-                i_delta,
-                i_gamma,
-                i_sigma,
-                i_pincode,
+    for tau_start, global_start in run_progress:
+        state = tuple(tau_start) + global_start
+        current_chi2 = score(state)
+        converged = False
+        for _ in range(max_iterations):
+            total_iterations += 1
+            neighbours = _neighbours(
+                state,
+                n_channels,
+                grid,
+                tau_selected,
+                global_selected,
+                lower,
+                upper,
             )
-            best_current = current
-            fit_progress.set_postfix(
-                best_chi2=f"{best_chi2:.4g}",
-                refresh=False,
-            )
-    fit_progress.close()
+            if not neighbours:
+                converged = True
+                break
+            values = score_many(neighbours)
+            index = int(np.argmin(values))
+            if values[index] >= current_chi2:
+                converged = True
+                break
+            state = neighbours[index]
+            current_chi2 = float(values[index])
+        all_converged &= converged
+        if current_chi2 < best_chi2:
+            best_chi2 = current_chi2
+            best_state = state
+            run_progress.set_postfix(best_chi2=f"{best_chi2:.4g}")
 
-    if best_indices is None or best_current is None:
-        raise RuntimeError("MAR grid search produced no result.")
-    i_T, i_delta, i_gamma, i_sigma, i_pincode = best_indices
-    tau_fit = np.sort(grid.tau[pincodes[i_pincode]])[::-1]
-    Ifit_nA = _evaluate_mar_with_voltage_noise(
-        grid.V_mV,
-        tau=tau_fit,
-        T_K=float(grid.T_K[i_T]),
-        Delta_meV=float(grid.Delta_meV[i_delta]),
-        gamma_meV=float(grid.gamma_meV[i_gamma]),
-        sigmaV_mV=float(grid.sigmaV_mV[i_sigma]),
+    if best_state is None:
+        raise RuntimeError("gradient search produced no result.")
+    tau_indices = np.asarray(best_state[:n_channels], dtype=np.intp)
+    i_T, i_delta, i_gamma, i_sigma = best_state[n_channels:]
+    fit_current = model_cache.get_many([best_state], currents, n_channels)[0]
+    residual = np.full_like(data, np.nan)
+    residual[fit_mask] = fit_current[fit_mask] - data[fit_mask]
+    parameter_values = {
+        name: float(value)
+        for name, value in zip(
+            tau_names,
+            grid.tau[tau_indices],
+            strict=True,
+        )
+    }
+    parameter_values.update(
+        {
+            "T_K": float(grid.T_K[i_T]),
+            "Delta_meV": float(grid.Delta_meV[i_delta]),
+            "gamma_meV": float(grid.gamma_meV[i_gamma]),
+            "sigmaV_mV": float(grid.sigmaV_mV[i_sigma]),
+        }
     )
-    residual = np.full_like(I_data, np.nan)
-    residual[fit_mask] = Ifit_nA[fit_mask] - I_data[fit_mask]
-    degrees_of_freedom = V_fit.size
-    return MARGridFitResult(
-        tau=tau_fit,
+    return MARFitResult(
+        tau=np.sort(grid.tau[tau_indices])[::-1],
         T_K=float(grid.T_K[i_T]),
         Delta_meV=float(grid.Delta_meV[i_delta]),
         gamma_meV=float(grid.gamma_meV[i_gamma]),
         sigmaV_mV=float(grid.sigmaV_mV[i_sigma]),
-        chi2=float(best_chi2),
-        reduced_chi2=float(best_chi2 / degrees_of_freedom),
+        parameter_values=parameter_values,
+        chi2=best_chi2,
+        reduced_chi2=best_chi2 / np.count_nonzero(fit_mask),
         V_mV=grid.V_mV.copy(),
-        I_exp_nA=I_data.copy(),
-        Ifit_nA=Ifit_nA,
+        I_exp_nA=data.copy(),
+        Ifit_nA=fit_current,
         residual_nA=residual,
-        pincode_index=i_pincode,
         parameter_index=(i_T, i_delta, i_gamma, i_sigma),
-        pincodes_tested=pincodes.shape[0],
-        grid_points_tested=total_global * pincodes.shape[0],
+        candidates_tested=len(score_cache),
+        iterations=total_iterations,
+        restarts=len(starts) - 1,
+        converged=all_converged,
         fitting_time_s=perf_counter() - start,
     )
 
 
-def generate_pincodes(
-    tau: ArrayLike,
+def _neighbours(
+    state: tuple[int, ...],
     n_channels: int,
-    *,
-    tau_sum_bounds: tuple[float, float] = (0.0, np.inf),
-    progress: bool = False,
-) -> IntArray:
-    """Return conductance-constrained pincodes using branch-and-bound.
-
-    Channel permutations are removed by generating nondecreasing transmission
-    indices.  A partial pincode is pruned when its smallest possible
-    completion exceeds the upper conductance bound or its largest possible
-    completion cannot reach the lower bound.
-    """
-    tau_grid = _parameter_axis(tau, "tau", 4)
-    if n_channels < 1:
-        raise ValueError("n_channels must be at least one.")
-    lower, upper = map(float, tau_sum_bounds)
-    if lower > upper:
-        raise ValueError("tau_sum_bounds must satisfy lower <= upper.")
-    total = comb(tau_grid.size + n_channels - 1, n_channels)
-    progress_bar = tqdm(
-        total=total,
-        desc="Pincodes",
-        unit="candidate",
-        disable=not progress,
-    )
-    accepted: list[tuple[int, ...]] = []
-    prefix: list[int] = []
-    pending_progress = 0
-
-    def completion_count(start: int, remaining: int) -> int:
-        if remaining == 0:
-            return 1
-        return comb(tau_grid.size - start + remaining - 1, remaining)
-
-    def advance(count: int) -> None:
-        nonlocal pending_progress
-        pending_progress += count
-        if pending_progress >= 10_000:
-            progress_bar.update(pending_progress)
-            pending_progress = 0
-
-    def search(start: int, remaining: int, transmission: float) -> None:
-        possibilities = completion_count(start, remaining)
-        tolerance = 1.0e-12
-
-        if transmission > upper + tolerance:
-            advance(possibilities)
-            return
-        if remaining == 0:
-            if lower - tolerance <= transmission <= upper + tolerance:
-                accepted.append(tuple(prefix))
-            advance(1)
-            return
-
-        minimum = transmission + remaining * tau_grid[start]
-        maximum = transmission + remaining * tau_grid[-1]
-        if minimum > upper + tolerance or maximum < lower - tolerance:
-            advance(possibilities)
-            return
-
-        for index in range(start, tau_grid.size):
-            prefix.append(index)
-            search(
-                index,
-                remaining - 1,
-                transmission + float(tau_grid[index]),
+    grid: MARGrid,
+    tau_selected: tuple[NDArray[np.int64], ...],
+    global_selected: tuple[NDArray[np.int64], ...],
+    lower: float,
+    upper: float,
+) -> list[tuple[int, ...]]:
+    """Return unique, valid, one-grid-step neighbours of ``state``."""
+    result: set[tuple[int, ...]] = set()
+    tau_state = state[:n_channels]
+    globals_state = state[n_channels:]
+    for channel in range(n_channels):
+        indices = tau_selected[channel]
+        if indices.size == 1:
+            continue
+        position = int(np.flatnonzero(indices == tau_state[channel])[0])
+        for direction in (-1, 1):
+            new_position = position + direction
+            if not 0 <= new_position < indices.size:
+                continue
+            changed = list(tau_state)
+            changed[channel] = int(indices[new_position])
+            tau_sum = float(np.sum(grid.tau[changed]))
+            if lower <= tau_sum <= upper:
+                result.add(tuple(changed) + globals_state)
+    # A narrow conductance interval can forbid every single-channel step.
+    # Exchange moves preserve the total approximately while redistributing
+    # transmission between two channels.
+    for first in range(n_channels):
+        for second in range(first + 1, n_channels):
+            first_indices = tau_selected[first]
+            second_indices = tau_selected[second]
+            if first_indices.size == 1 or second_indices.size == 1:
+                continue
+            first_position = int(
+                np.flatnonzero(first_indices == tau_state[first])[0]
             )
-            prefix.pop()
+            second_position = int(
+                np.flatnonzero(second_indices == tau_state[second])[0]
+            )
+            for direction in (-1, 1):
+                new_first = first_position + direction
+                new_second = second_position - direction
+                if not (
+                    0 <= new_first < first_indices.size
+                    and 0 <= new_second < second_indices.size
+                ):
+                    continue
+                changed = list(tau_state)
+                changed[first] = int(first_indices[new_first])
+                changed[second] = int(second_indices[new_second])
+                tau_sum = float(np.sum(grid.tau[changed]))
+                if lower <= tau_sum <= upper:
+                    result.add(tuple(changed) + globals_state)
+    for dimension, indices in enumerate(global_selected):
+        if indices.size == 1:
+            continue
+        current = globals_state[dimension]
+        position = int(np.flatnonzero(indices == current)[0])
+        for direction in (-1, 1):
+            new_position = position + direction
+            if 0 <= new_position < indices.size:
+                changed = list(globals_state)
+                changed[dimension] = int(indices[new_position])
+                result.add(tau_state + tuple(changed))
+    result.discard(state)
+    return list(result)
 
-    search(start=0, remaining=n_channels, transmission=0.0)
-    if pending_progress:
-        progress_bar.update(pending_progress)
-    progress_bar.close()
-    if not accepted:
-        return np.empty((0, n_channels), dtype=np.int32)
-    return np.asarray(accepted, dtype=np.int32)
+
+def _project_tau_indices(
+    indices: tuple[int, ...],
+    tau: FloatArray,
+    selected: tuple[NDArray[np.int64], ...],
+    lower: float,
+    upper: float,
+) -> tuple[int, ...] | None:
+    """Greedily move guesses into the total-transmission interval."""
+    state = tuple(indices)
+    visited = {state}
+    for _ in range(sum(axis.size for axis in selected) + 1):
+        total = float(np.sum(tau[list(state)]))
+        if lower <= total <= upper:
+            return state
+        direction = 1 if total < lower else -1
+        candidates = []
+        for channel, axis in enumerate(selected):
+            position = int(np.flatnonzero(axis == state[channel])[0])
+            new_position = position + direction
+            if not 0 <= new_position < axis.size:
+                continue
+            changed = list(state)
+            changed[channel] = int(axis[new_position])
+            candidate = tuple(changed)
+            if candidate not in visited:
+                candidates.append(candidate)
+        if not candidates:
+            return None
+        target = lower if direction > 0 else upper
+        state = min(
+            candidates,
+            key=lambda candidate: abs(
+                float(np.sum(tau[list(candidate)])) - target
+            ),
+        )
+        visited.add(state)
+    return None
+
+
+def _settings_indices(
+    axis: FloatArray,
+    setting: tuple[float, float, float, bool],
+    name: str,
+) -> tuple[NDArray[np.int64], int]:
+    """Return allowed grid indices and the guess index for one parameter."""
+    if len(setting) != 4:
+        raise ValueError(
+            f"settings[{name!r}] must be (guess, lower, upper, fixed)."
+        )
+    guess, lower, upper = map(float, setting[:3])
+    fixed = bool(setting[3])
+    if not np.all(np.isfinite([guess, lower, upper])):
+        raise ValueError(f"settings[{name!r}] must contain finite values.")
+    if lower > upper:
+        raise ValueError(f"settings[{name!r}] must satisfy lower <= upper.")
+    if not lower <= guess <= upper:
+        raise ValueError(f"the guess for {name} must lie inside its bounds.")
+    allowed = np.flatnonzero((axis >= lower) & (axis <= upper))
+    if allowed.size == 0:
+        raise ValueError(
+            f"the bounds for {name} contain no value on the loaded grid."
+        )
+    nearest = int(allowed[np.argmin(np.abs(axis[allowed] - guess))])
+    if fixed:
+        tolerance = np.finfo(np.float64).eps * max(1.0, abs(guess)) * 8.0
+        if not np.isclose(axis[nearest], guess, rtol=0.0, atol=tolerance):
+            raise ValueError(
+                f"fixed {name}={guess!r} is not on the loaded grid; nearest "
+                f"allowed value is {float(axis[nearest])!r}."
+            )
+        allowed = np.asarray([nearest], dtype=np.int64)
+    return np.asarray(allowed, dtype=np.int64), nearest
 
 
 def _extend_current_bank(
     V_mV: FloatArray,
-    currents_nA: FloatArray,
-    V_support_mV: FloatArray,
+    currents: FloatArray,
+    support: FloatArray,
     extrapolation_points: int,
 ) -> FloatArray:
-    """Interpolate internally and linearly extrapolate both IV edges."""
-    count = min(int(extrapolation_points), V_mV.size)
+    count = min(extrapolation_points, V_mV.size)
     if count < 2:
         raise ValueError("at least two voltage points are required.")
-    extended = np.stack(
-        [np.interp(V_support_mV, V_mV, current) for current in currents_nA]
-    )
-
-    left_x = V_mV[:count]
-    left_centered = left_x - np.mean(left_x)
-    left_slopes = (
-        currents_nA[:, :count] @ left_centered / np.sum(left_centered**2)
-    )
-    left = V_support_mV < V_mV[0]
-    extended[:, left] = currents_nA[:, [0]] + left_slopes[:, None] * (
-        V_support_mV[left] - V_mV[0]
-    )
-
-    right_x = V_mV[-count:]
-    right_centered = right_x - np.mean(right_x)
-    right_slopes = (
-        currents_nA[:, -count:] @ right_centered / np.sum(right_centered**2)
-    )
-    right = V_support_mV > V_mV[-1]
-    extended[:, right] = currents_nA[:, [-1]] + right_slopes[:, None] * (
-        V_support_mV[right] - V_mV[-1]
-    )
+    extended = np.stack([np.interp(support, V_mV, row) for row in currents])
+    for edge, voltage, outside in (
+        (slice(0, count), V_mV[0], support < V_mV[0]),
+        (slice(-count, None), V_mV[-1], support > V_mV[-1]),
+    ):
+        x = V_mV[edge]
+        centered = x - np.mean(x)
+        slopes = currents[:, edge] @ centered / np.sum(centered**2)
+        boundary = currents[:, 0] if voltage == V_mV[0] else currents[:, -1]
+        extended[:, outside] = boundary[:, None] + slopes[:, None] * (
+            support[outside] - voltage
+        )
     return extended
-
-
-def _evaluate_mar_with_voltage_noise(
-    V_mV: FloatArray,
-    *,
-    tau: FloatArray,
-    T_K: float,
-    Delta_meV: float,
-    gamma_meV: float,
-    sigmaV_mV: float,
-    extrapolation_points: int = 25,
-) -> FloatArray:
-    """Recalculate one complete pincode with padded voltage broadening."""
-    if sigmaV_mV == 0.0:
-        return np.asarray(
-            get_Imar_nA(
-                V_mV=V_mV,
-                tau=tau,
-                T_K=T_K,
-                Delta_meV=Delta_meV,
-                gamma_meV=gamma_meV,
-                caching=True,
-            ),
-            dtype=np.float64,
-        )
-
-    I_nA = get_Imar_nA(
-        V_mV=V_mV,
-        tau=tau,
-        T_K=T_K,
-        Delta_meV=Delta_meV,
-        gamma_meV=gamma_meV,
-        caching=True,
-    )
-    V_support_mV = make_bias_support_grid(V_mV, sigmaV_mV)
-    I_support_nA = _extend_current_bank(
-        V_mV,
-        np.asarray(I_nA, dtype=np.float64)[None, :],
-        V_support_mV,
-        extrapolation_points,
-    )[0]
-    broadened_support_nA = apply_voltage_noise(
-        V_support_mV,
-        np.asarray(I_support_nA, dtype=np.float64),
-        sigmaV_mV,
-        order=32,
-    )
-    return np.interp(V_mV, V_support_mV, broadened_support_nA)
-
-
-def broaden_current_bank(
-    V_mV: ArrayLike,
-    I_tau_nA: ArrayLike,
-    sigmaV_mV: float,
-) -> FloatArray:
-    """Apply the shared BCS voltage-noise kernel to a current bank.
-
-    This is a low-level operation on the supplied support.  To avoid physical
-    boundary artifacts, the support must already extend beyond the desired
-    output interval.  :func:`prepare_mar_database` handles that padding and
-    cropping automatically.
-    """
-    V = _axis(V_mV, "V_mV")
-    currents = np.asarray(I_tau_nA, dtype=np.float64)
-    if currents.ndim != 2 or currents.shape[1] != V.size:
-        raise ValueError("I_tau_nA must have shape (n_tau, n_voltage).")
-    if not np.all(np.isfinite(currents)):
-        raise ValueError("I_tau_nA must be finite.")
-    sigma = float(sigmaV_mV)
-    if not np.isfinite(sigma) or sigma < 0.0:
-        raise ValueError("sigmaV_mV must be finite and nonnegative.")
-    if sigma == 0.0:
-        return currents.copy()
-    return np.stack(
-        [
-            apply_voltage_noise(V, current, sigma, order=32)
-            for current in currents
-        ]
-    )
-
-
-def _best_pincode(
-    bank: FloatArray,
-    pincodes: IntArray,
-    target: FloatArray,
-    weights: FloatArray,
-    batch_size: int,
-    *,
-    backend: FitBackend = "auto",
-    progress_bar=None,
-) -> tuple[float, int, FloatArray]:
-    selected_backend = _select_fit_backend(backend)
-    if selected_backend == "jax":
-        return _best_pincode_jax(
-            bank,
-            pincodes,
-            target,
-            weights,
-            batch_size,
-            progress_bar,
-        )
-    return _best_pincode_numpy(
-        bank,
-        pincodes,
-        target,
-        weights,
-        batch_size,
-        progress_bar,
-    )
-
-
-def _select_fit_backend(backend: FitBackend) -> Literal["jax", "numpy"]:
-    """Resolve the requested scoring backend without requiring JAX."""
-    if backend == "numpy":
-        return "numpy"
-    try:
-        import jax  # noqa: F401
-    except ImportError:
-        if backend == "jax":
-            raise ImportError(
-                "backend='jax' requires JAX; install it or use backend='numpy'."
-            ) from None
-        return "numpy"
-    return "jax"
-
-
-def _best_pincode_numpy(
-    bank: FloatArray,
-    pincodes: IntArray,
-    target: FloatArray,
-    weights: FloatArray,
-    batch_size: int,
-    progress_bar=None,
-) -> tuple[float, int, FloatArray]:
-    """Find the best pincode without a ``batch x channel x voltage`` array."""
-    best_chi2 = np.inf
-    best_index = -1
-    best_current: FloatArray | None = None
-    for start in range(0, pincodes.shape[0], batch_size):
-        stop = min(start + batch_size, pincodes.shape[0])
-        batch = pincodes[start:stop]
-        models = np.zeros((batch.shape[0], bank.shape[1]), dtype=np.float64)
-        for channel in range(batch.shape[1]):
-            models += bank[batch[:, channel]]
-        models -= target[None, :]
-        chi2 = np.einsum("ij,j,ij->i", models, weights, models)
-        local = int(np.argmin(chi2))
-        if chi2[local] < best_chi2:
-            best_chi2 = float(chi2[local])
-            best_index = start + local
-            best_current = np.sum(bank[pincodes[best_index]], axis=0)
-        if progress_bar is not None:
-            progress_bar.update(stop - start)
-    if best_current is None:
-        raise RuntimeError("pincode search received no candidates.")
-    return best_chi2, best_index, best_current
-
-
-def _best_pincode_jax(
-    bank: FloatArray,
-    pincodes: IntArray,
-    target: FloatArray,
-    weights: FloatArray,
-    batch_size: int,
-    progress_bar=None,
-) -> tuple[float, int, FloatArray]:
-    """Find the best pincode with a fused, memory-bounded JAX scorer."""
-    import jax
-    import jax.numpy as jnp
-
-    # Use float64 when enabled, otherwise consistently score in float32.  This
-    # avoids changing the process-wide JAX configuration from a library helper.
-    dtype = jnp.float64 if jax.config.x64_enabled else jnp.float32
-    bank_device = jax.device_put(np.asarray(bank, dtype=np.dtype(dtype)))
-    target_device = jax.device_put(np.asarray(target, dtype=np.dtype(dtype)))
-    weights_device = jax.device_put(np.asarray(weights, dtype=np.dtype(dtype)))
-
-    batch_minimum = _jax_batch_minimum()
-
-    best_chi2 = np.inf
-    best_index = -1
-    for start in range(0, pincodes.shape[0], batch_size):
-        stop = min(start + batch_size, pincodes.shape[0])
-        batch = np.asarray(pincodes[start:stop], dtype=np.int32)
-        chi2_device, local_device = batch_minimum(
-            bank_device,
-            target_device,
-            weights_device,
-            jax.device_put(batch),
-        )
-        chi2 = float(chi2_device)
-        local = int(local_device)
-        if chi2 < best_chi2:
-            best_chi2 = chi2
-            best_index = start + local
-        if progress_bar is not None:
-            progress_bar.update(stop - start)
-
-    if best_index < 0:
-        raise RuntimeError("pincode search received no candidates.")
-    best_current = np.sum(bank[pincodes[best_index]], axis=0)
-    return best_chi2, best_index, best_current
-
-
-@lru_cache(maxsize=1)
-def _jax_batch_minimum():
-    """Build one compiled scorer reused across all global grid points."""
-    import jax
-    import jax.numpy as jnp
-
-    @jax.jit
-    def score(bank, target, weights, indices):
-        models = jnp.sum(bank[indices], axis=1)
-        residuals = models - target[None, :]
-        chi2 = jnp.sum(weights[None, :] * residuals * residuals, axis=1)
-        index = jnp.argmin(chi2)
-        return chi2[index], index
-
-    return score
 
 
 def _fit_weights(
@@ -937,10 +898,7 @@ def _fit_weights(
     if array.ndim == 0:
         array = np.full(shape, float(array), dtype=np.float64)
     if array.shape != shape:
-        raise ValueError(
-            "weights must be scalar or have the same shape as "
-            "database.grid.V_mV."
-        )
+        raise ValueError("weights must be scalar or match grid.V_mV.")
     if np.any(~np.isfinite(array)):
         raise ValueError("weights must be finite.")
     if np.any(array < 0.0):
@@ -950,34 +908,16 @@ def _fit_weights(
     return array
 
 
-def _axis(
-    values: ArrayLike, name: str, *, uniform: bool = False
-) -> FloatArray:
+def _axis(values: ArrayLike, name: str) -> FloatArray:
     axis = np.asarray(values, dtype=np.float64).reshape(-1)
     if axis.size == 0 or not np.all(np.isfinite(axis)):
         raise ValueError(f"{name} must contain finite values.")
-    if axis.size > 1:
-        differences = np.diff(axis)
-        if np.any(differences <= 0.0):
-            raise ValueError(f"{name} must be strictly increasing.")
-        if uniform and not np.allclose(
-            differences,
-            differences[0],
-            rtol=1.0e-7,
-            atol=1.0e-12,
-        ):
-            raise ValueError(f"{name} must be uniformly spaced.")
-    elif uniform:
-        raise ValueError(f"{name} must contain at least two values.")
+    if axis.size > 1 and np.any(np.diff(axis) <= 0.0):
+        raise ValueError(f"{name} must be strictly increasing.")
     return axis
 
 
-def _parameter_axis(
-    values: ArrayLike,
-    name: str,
-    decimals: int,
-) -> FloatArray:
-    """Normalize an arbitrary parameter grid to native cache precision."""
+def _parameter_axis(values: ArrayLike, name: str, decimals: int) -> FloatArray:
     axis = np.asarray(values, dtype=np.float64).reshape(-1)
     if axis.size == 0 or not np.all(np.isfinite(axis)):
         raise ValueError(f"{name} must contain finite values.")
@@ -986,10 +926,11 @@ def _parameter_axis(
 
 __all__ = [
     "MARDatabase",
+    "MARFitResult",
     "MARGrid",
-    "MARGridFitResult",
-    "broaden_current_bank",
-    "fit_mar_grid",
-    "generate_pincodes",
+    "clear_mar_database_cache",
+    "estimate_GN_bounds",
+    "fit_mar",
     "prepare_mar_database",
+    "prepare_mar_trace",
 ]
