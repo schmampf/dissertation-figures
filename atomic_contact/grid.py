@@ -14,5 +14,5 @@ grid = MARGrid(
 )
 database = prepare_mar_database(grid)
 
-with open("grid.pkl", "wb") as f:
+with open("atomic_contact/grid.pkl", "wb") as f:
     pickle.dump(database, f)
