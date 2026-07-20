@@ -8,7 +8,7 @@ grid = MARGrid(
     V_mV=np.linspace(-0.9, 0.9, 1801),
     tau=np.linspace(0, 1, 1001),
     T_K=0.0,
-    Delta_meV=np.linspace(0.187, 0.191, 9),
+    Delta_meV=np.linspace(0.187, 0.193, 13),
     gamma_meV=1e-6,
     sigmaV_mV=np.linspace(0, 0.05, 101),
 )

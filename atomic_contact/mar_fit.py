@@ -15,7 +15,7 @@ from os import PathLike
 from pathlib import Path
 import pickle
 from time import perf_counter
-from typing import Mapping
+from typing import Callable, Mapping
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -329,7 +329,7 @@ def fit_mar(
     tau_sum_bounds: tuple[float, float] = (0.0, np.inf),
     weights: ArrayLike | float | None = None,
     voltage_bounds_mV: tuple[float, float] | None = None,
-    restarts: int = 4,
+    restarts: int | ArrayLike = 4,
     max_iterations: int = 500,
     random_seed: int | None = 0,
     progress: bool = True,
@@ -343,6 +343,11 @@ def fit_mar(
     result per row in a list. ``weights`` may be scalar, shared across all
     traces with shape ``(n_voltage,)``, or trace-specific with the same shape
     as a two-dimensional ``I_nA`` input.
+
+    ``restarts`` may be one nonnegative integer for every trace or a sequence
+    containing one restart count per input trace. This allows difficult
+    traces to receive additional random starts without slowing down the full
+    batch.
 
     ``database`` may be an already loaded :class:`MARDatabase` or the path to
     its pickle file, for example ``"grid.pkl"``. A file is loaded only once
@@ -360,6 +365,7 @@ def fit_mar(
     model_cache = _ModelCurrentCache(model_cache_size)
     data = np.asarray(I_nA, dtype=np.float64)
     if data.ndim == 1:
+        restart_counts = _restart_counts(restarts, 1)
         return _fit_mar_trace(
             data,
             database,
@@ -367,7 +373,7 @@ def fit_mar(
             tau_sum_bounds=tau_sum_bounds,
             weights=weights,
             voltage_bounds_mV=voltage_bounds_mV,
-            restarts=restarts,
+            restarts=restart_counts[0],
             max_iterations=max_iterations,
             random_seed=random_seed,
             progress=progress,
@@ -379,6 +385,7 @@ def fit_mar(
         raise ValueError(
             "each I_nA trace must have the same shape as grid.V_mV."
         )
+    restart_counts = _restart_counts(restarts, data.shape[0])
 
     fit_weights = weights
     weights_array: NDArray[np.float64] | None = None
@@ -404,13 +411,13 @@ def fit_mar(
     )
     results = []
     current_settings = dict(settings)
-    iterator = tqdm(
-        range(data.shape[0]),
-        desc="MAR traces",
-        unit="trace",
+    batch_progress = tqdm(
+        total=sum(count + 1 for count in restart_counts),
+        desc="MAR fits",
+        unit="run",
         disable=not progress,
     )
-    for index in iterator:
+    for index in range(data.shape[0]):
         trace_seed = trace_seeds[index]
         result = _fit_mar_trace(
             data[index],
@@ -423,11 +430,12 @@ def fit_mar(
                 else fit_weights
             ),
             voltage_bounds_mV=voltage_bounds_mV,
-            restarts=restarts,
+            restarts=restart_counts[index],
             max_iterations=max_iterations,
             random_seed=trace_seed,
             progress=False,
             model_cache=model_cache,
+            run_completed=batch_progress.update,
         )
         results.append(result)
         if warm_start:
@@ -445,7 +453,30 @@ def fit_mar(
                     fixed,
                 ) in current_settings.items()
             }
+    batch_progress.close()
     return results
+
+
+def _restart_counts(restarts: int | ArrayLike, n_traces: int) -> list[int]:
+    """Normalize one restart count or one count per trace."""
+    values = np.asarray(restarts)
+    if values.ndim == 0:
+        values = np.full(n_traces, values.item())
+    elif values.ndim != 1 or values.size != n_traces:
+        raise ValueError(
+            "restarts must be an integer or a sequence with one value per "
+            "trace."
+        )
+    try:
+        numeric = values.astype(np.float64)
+    except (TypeError, ValueError) as error:
+        raise TypeError("restarts must contain integers.") from error
+    if not np.all(np.isfinite(numeric)):
+        raise ValueError("restarts must contain finite integers.")
+    integer = numeric.astype(np.int64)
+    if np.any(numeric != integer) or np.any(integer < 0):
+        raise ValueError("restarts must contain nonnegative integers.")
+    return [int(value) for value in integer]
 
 
 def _load_mar_database(
@@ -502,6 +533,7 @@ def _fit_mar_trace(
     random_seed: int | None = 0,
     progress: bool = True,
     model_cache: _ModelCurrentCache | None = None,
+    run_completed: Callable[[], None] | None = None,
 ) -> MARFitResult:
     """Fit an MAR trace by discrete steepest descent on the loaded grid.
 
@@ -627,6 +659,8 @@ def _fit_mar_trace(
             random_tau, grid.tau, tau_selected, lower, upper
         )
         if random_tau is None:
+            if run_completed is not None:
+                run_completed()
             continue
         random_global = tuple(
             int(rng.choice(indices)) for indices in global_selected
@@ -673,6 +707,8 @@ def _fit_mar_trace(
             best_chi2 = current_chi2
             best_state = state
             run_progress.set_postfix(best_chi2=f"{best_chi2:.4g}")
+        if run_completed is not None:
+            run_completed()
 
     if best_state is None:
         raise RuntimeError("gradient search produced no result.")

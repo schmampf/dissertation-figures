@@ -4,6 +4,7 @@ from dataclasses import replace
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+
 from superconductivity.api import G0_muS
 from superconductivity.optimizers import fit_model
 from superconductivity.optimizers.bcs import get_model_spec

@@ -20,22 +20,28 @@ settings = {
     "tau_B": (0.00, 0.00, 1.00, True),
     "tau_C": (0.00, 0.00, 1.00, True),
     "T_K": (0.00, 0.00, 1.21, True),
-    "Delta_meV": (0.1885, 0.187, 0.191, False),
+    "Delta_meV": (0.1885, 0.1875, 0.190, False),
     "gamma_meV": (1e-6, 1e-6, 1e-2, True),
-    "sigmaV_mV": (0.026, 0.01, 0.04, False),
+    "sigmaV_mV": (0.026, 0.02, 0.03, False),
 }
-restarts = 10
 Vnan_mV = 0.04
 tau_sum_bounds = (0.0, 5.0)
+i_skip = np.array([0, 9, 19, 71, 206, 262])
 
-weights = np.divide(1, V_mV, out=np.full_like(V_mV, np.nan), where=V_mV != 0.0)
+weights = np.divide(1, np.abs(V_mV), out=np.full_like(V_mV, 0), where=V_mV != 0.0)
 mask = np.abs(V_mV) <= Vnan_mV
 I_nA = np.copy(Iexp_nA)
+
+restarts = np.full((I_nA.shape[0]), 50)
+restarts[i_skip + 0] = 1700
+restarts[i_skip + 1] = 1700
+
 I_nA[:, mask] = np.nan
 results = fit_mar(
     I_nA,
     "grid.pkl",
     settings=settings,
+    weights=weights,
     tau_sum_bounds=tau_sum_bounds,
     restarts=restarts,
     progress=True,
