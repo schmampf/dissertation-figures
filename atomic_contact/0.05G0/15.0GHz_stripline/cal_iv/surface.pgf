@@ -381,8 +381,8 @@
 \pgftext[x=2.034432in,y=0.950000in,,,rotate=88.223288]{\color{textcolor}{\sffamily\fontsize{7.000000}{8.400000}\selectfont\catcode`\^=\active\def^{\ifmmode\sp\else\^{}\fi}\catcode`\%=\active\def%{\%}$eI\,/\,\Delta_0 G_\mathrm{N}$}}%
 \end{pgfscope}%
 \begin{pgfscope}%
-\pgfsys@transformshift{0.107500in}{0.219722in}%
-\pgftext[left,bottom]{\includegraphics[interpolate=true,width=1.679722in,height=1.341667in]{surface-img0.png}}%
+\pgfsys@transformshift{0.107500in}{0.210278in}%
+\pgftext[left,bottom]{\includegraphics[interpolate=true,width=1.703056in,height=1.351111in]{surface-img0.png}}%
 \end{pgfscope}%
 \begin{pgfscope}%
 \pgfsetrectcap%
