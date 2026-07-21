@@ -33,6 +33,16 @@
 %%   \setmainfont{Arial}
 %%   \setsansfont{Arial}
 %%   \usepackage{cmbright}
+%%   \usepackage{amsmath}
+%%   \usepackage{amsfonts}
+%%   \usepackage{amssymb}
+%%   \usepackage{physics}
+%%   \usepackage{accents}
+%%   \DeclareRobustCommand{\mathhbar}{\ensuremath{{\mathchar'26\mkern-9muh}}}
+%%   \let\texthbar\hbar
+%%   \let\hbar\mathhbar
+%%   \usepackage{textcomp}
+%%   \usepackage{upgreek}
 %%   \usepackage{lmodern}
 %%   \makeatletter\@ifpackageloaded{underscore}{}{\usepackage[strings]{underscore}}\makeatother
 %%

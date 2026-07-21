@@ -33,6 +33,16 @@
 %%   \setmainfont{Arial}
 %%   \setsansfont{Arial}
 %%   \usepackage{cmbright}
+%%   \usepackage{amsmath}
+%%   \usepackage{amsfonts}
+%%   \usepackage{amssymb}
+%%   \usepackage{physics}
+%%   \usepackage{accents}
+%%   \DeclareRobustCommand{\mathhbar}{\ensuremath{{\mathchar'26\mkern-9muh}}}
+%%   \let\texthbar\hbar
+%%   \let\hbar\mathhbar
+%%   \usepackage{textcomp}
+%%   \usepackage{upgreek}
 %%   \usepackage{lmodern}
 %%   \makeatletter\@ifpackageloaded{underscore}{}{\usepackage[strings]{underscore}}\makeatother
 %%
@@ -372,7 +382,7 @@
 \end{pgfscope}%
 \begin{pgfscope}%
 \pgfsys@transformshift{0.144444in}{0.308889in}%
-\pgftext[left,bottom]{\pgfimage[interpolate=true,width=1.651667in,height=1.166389in]{surface-img0.png}}%
+\pgftext[left,bottom]{\includegraphics[interpolate=true,width=1.651667in,height=1.166389in]{surface-img0.png}}%
 \end{pgfscope}%
 \begin{pgfscope}%
 \pgfsetrectcap%
