@@ -10,7 +10,7 @@ grid = MARGrid(
     T_K=0.0,
     Delta_meV=np.linspace(0.187, 0.193, 13),
     gamma_meV=1e-6,
-    sigmaV_mV=np.linspace(0, 0.05, 101),
+    sigmaV_mV=np.linspace(0, 0.04, 81),
 )
 database = prepare_mar_database(grid)
 
