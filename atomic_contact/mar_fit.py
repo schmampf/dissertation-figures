@@ -349,6 +349,11 @@ def fit_mar(
     traces to receive additional random starts without slowing down the full
     batch.
 
+    Omitted transmission settings (``tau_1`` through ``tau_C``) are treated
+    as disabled channels with the setting ``(0.0, 0.0, 0.0, True)``. The
+    global ``T_K``, ``Delta_meV``, ``gamma_meV``, and ``sigmaV_mV`` settings
+    remain required.
+
     ``database`` may be an already loaded :class:`MARDatabase` or the path to
     its pickle file, for example ``"grid.pkl"``. A file is loaded only once
     per call, including batch fits.
@@ -366,19 +371,29 @@ def fit_mar(
     data = np.asarray(I_nA, dtype=np.float64)
     if data.ndim == 1:
         restart_counts = _restart_counts(restarts, 1)
-        return _fit_mar_trace(
-            data,
-            database,
-            settings=settings,
-            tau_sum_bounds=tau_sum_bounds,
-            weights=weights,
-            voltage_bounds_mV=voltage_bounds_mV,
-            restarts=restart_counts[0],
-            max_iterations=max_iterations,
-            random_seed=random_seed,
-            progress=progress,
-            model_cache=model_cache,
+        fit_progress = tqdm(
+            total=restart_counts[0] + 1,
+            desc="MAR fits",
+            unit="run",
+            disable=not progress,
         )
+        try:
+            return _fit_mar_trace(
+                data,
+                database,
+                settings=settings,
+                tau_sum_bounds=tau_sum_bounds,
+                weights=weights,
+                voltage_bounds_mV=voltage_bounds_mV,
+                restarts=restart_counts[0],
+                max_iterations=max_iterations,
+                random_seed=random_seed,
+                progress=False,
+                model_cache=model_cache,
+                run_completed=fit_progress.update,
+            )
+        finally:
+            fit_progress.close()
     if data.ndim != 2:
         raise ValueError("I_nA must be one- or two-dimensional.")
     if data.shape[1:] != database.grid.V_mV.shape:
@@ -538,11 +553,10 @@ def _fit_mar_trace(
     """Fit an MAR trace by discrete steepest descent on the loaded grid.
 
     ``settings`` uses the same ``(guess, lower, upper, fixed)`` tuples as the
-    BCS fit helpers.  It must define ``tau_1`` through ``tau_9``, ``tau_A``,
-    ``tau_B``, ``tau_C``, ``T_K``, ``Delta_meV``, ``gamma_meV``, and
-    ``sigmaV_mV``.  Disable an unused channel with
-    ``(0.0, 0.0, 0.0, True)``.  Every value and bound is mapped onto the
-    corresponding loaded grid axis.
+    BCS fit helpers. It must define ``T_K``, ``Delta_meV``, ``gamma_meV``, and
+    ``sigmaV_mV``. Omitted transmission settings from ``tau_1`` through
+    ``tau_C`` are disabled automatically with ``(0.0, 0.0, 0.0, True)``.
+    Every value and bound is mapped onto the corresponding loaded grid axis.
 
     ``weights`` are arbitrary nonnegative point weights in the current-space
     objective ``sum(weights * (I_model_nA - I_exp_nA)**2)``.  A scalar is
@@ -563,9 +577,10 @@ def _fit_mar_trace(
     start = perf_counter()
     tau_names = TAU_NAMES
     global_names = ("T_K", "Delta_meV", "gamma_meV", "sigmaV_mV")
-    missing = [
-        name for name in tau_names + global_names if name not in settings
-    ]
+    settings = dict(settings)
+    for name in tau_names:
+        settings.setdefault(name, (0.0, 0.0, 0.0, True))
+    missing = [name for name in global_names if name not in settings]
     if missing:
         raise KeyError(f"Missing fit settings for {', '.join(missing)}.")
     n_channels = len(tau_names)
