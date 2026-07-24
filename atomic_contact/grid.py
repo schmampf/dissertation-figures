@@ -6,7 +6,7 @@ from mar_fit import MARGrid, prepare_mar_database
 
 grid = MARGrid(
     V_mV=np.linspace(-0.9, 0.9, 1801),
-    tau=np.linspace(0, 1, 1001),
+    tau=np.linspace(0, 1, 101),
     T_K=0.0,
     Delta_meV=np.linspace(0.187, 0.193, 13),
     gamma_meV=1e-6,
@@ -14,5 +14,5 @@ grid = MARGrid(
 )
 database = prepare_mar_database(grid)
 
-with open("grid.pkl", "wb") as f:
+with open("pregrid.pkl", "wb") as f:
     pickle.dump(database, f)
