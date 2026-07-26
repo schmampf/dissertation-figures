@@ -1,8 +1,8 @@
+from functools import lru_cache
+
 import matplotlib.pyplot as plt
 import numpy as np
 import superconductivity as sc
-from scipy.interpolate import RegularGridInterpolator
-from superconductivity.utilities.functions.upsampling import upsample
 
 # source /Users/oliver/Documents/cryolab/.venv/bin/activate
 
@@ -19,28 +19,53 @@ _, Imar_nA = sc.get_Imar_nA(
     show_progress=True,
 )
 Imar_nA = Imar_nA.T
-Vmar_mV = sc.bin_y_over_x(
-    upsample(Vgrid_mV), upsample(Imar_nA, axis=-1), Igrid_nA, axis=-1
-)
 
-Vmar_lookup = RegularGridInterpolator(
-    (tau_grid, Igrid_nA),
-    Vmar_mV,
-    method="linear",
-    bounds_error=False,
-    fill_value=np.nan,
-)
+
+@lru_cache(maxsize=256)
+def _get_total_mar_inverse(tau_values):
+    """Return the current and voltage axes for a parallel PIN code."""
+    transmissions = np.asarray(tau_values, dtype=float)
+    tau_indices = np.searchsorted(tau_grid, transmissions)
+    tau_indices = np.clip(tau_indices, 1, tau_grid.size - 1)
+    use_lower = np.abs(transmissions - tau_grid[tau_indices - 1]) <= np.abs(
+        transmissions - tau_grid[tau_indices]
+    )
+    tau_indices[use_lower] -= 1
+
+    # Imar_nA is the single cached MAR bank with shape (tau, voltage).
+    # Parallel channels share voltage, so their currents add directly.
+    total_current = np.sum(Imar_nA[tau_indices], axis=0)
+
+    # Numerical MAR curves can contain repeated current values. Sorting and
+    # removing duplicates makes the inverse suitable for np.interp.
+    order = np.argsort(total_current)
+    current = total_current[order]
+    voltage = Vgrid_mV[order]
+    current, unique = np.unique(current, return_index=True)
+    return current, voltage[unique]
 
 
 def get_Vmar_mV(I_nA, tau):
+    """Return MAR voltage for one channel or a parallel PIN code."""
     I_nA = np.asarray(I_nA, dtype=float)
-    points = np.column_stack(
-        (
-            np.full(I_nA.size, tau),
-            I_nA.ravel(),
-        )
+    transmissions = np.asarray(tau, dtype=float)
+    if transmissions.ndim > 1 or transmissions.size == 0:
+        raise ValueError("tau must be a scalar or a nonempty 1D sequence.")
+    if np.any(~np.isfinite(transmissions)) or np.any(
+        (transmissions < 0.0) | (transmissions > 1.0)
+    ):
+        raise ValueError("all transmissions must lie in [0, 1].")
+
+    current, voltage = _get_total_mar_inverse(
+        tuple(float(value) for value in transmissions.reshape(-1))
     )
-    return Vmar_lookup(points).reshape(I_nA.shape)
+    return np.interp(
+        I_nA,
+        current,
+        voltage,
+        left=np.nan,
+        right=np.nan,
+    )
 
 
 def get_rsj_Vj_mV(
@@ -51,13 +76,26 @@ def get_rsj_Vj_mV(
     get_Isc_nA,
     n_phi=2048,
 ):
-    """Return the nonlinear-RSJ junction voltage Vj(Ibias)."""
+    """Return nonlinear-RSJ junction voltage for a scalar or PIN code."""
     Ibias_nA = np.asarray(Ibias_nA, dtype=float)
+    transmissions = np.asarray(tau, dtype=float)
+    if transmissions.ndim > 1 or transmissions.size == 0:
+        raise ValueError("tau must be a scalar or a nonempty 1D sequence.")
+    if np.any(~np.isfinite(transmissions)) or np.any(
+        (transmissions < 0.0) | (transmissions > 1.0)
+    ):
+        raise ValueError("all transmissions must lie in [0, 1].")
 
     # Midpoints reduce the chance of evaluating exactly at V = 0.
     phi = (np.arange(n_phi, dtype=float) + 0.5) * (2 * np.pi / n_phi)
 
-    Is_nA = alpha * get_Isc_nA(phi, tau)
+    if transmissions.ndim == 0:
+        Is_nA = alpha * get_Isc_nA(phi, float(transmissions))
+    else:
+        Is_nA = alpha * np.sum(
+            [get_Isc_nA(phi, float(transmission)) for transmission in transmissions],
+            axis=0,
+        )
 
     # Assuming Imar(0) = 0.
     lower_static_nA = np.min(Is_nA)
@@ -92,8 +130,36 @@ plt.plot(
     Igrid_nA,
     get_rsj_Vj_mV(
         Igrid_nA,
-        tau=1.0,
-        alpha=0.5,
+        tau=(
+            0.1,
+            0.1,
+            0.1,
+            0.1,
+            0.1,
+            0.1,
+            0.1,
+            0.1,
+            0.1,
+            0.1,
+            0.1,
+            0.1,
+            0.1,
+            0.1,
+            0.1,
+            0.1,
+            0.1,
+            0.1,
+            0.1,
+            0.1,
+            0.1,
+            0.1,
+            0.1,
+            0.1,
+            0.1,
+            0.1,
+            0.1,
+        ),
+        alpha=1.0,
         get_Vmar_mV=get_Vmar_mV,
         get_Isc_nA=sc.get_cpr_abs,
     ),
