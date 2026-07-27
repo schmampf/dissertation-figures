@@ -25,6 +25,51 @@ BOLTZMANN_JK = 1.380649e-23
 PAIR_RESISTANCE_QUANTUM_OHM = PLANCK_JS / (2.0 * ELEMENTARY_CHARGE_C) ** 2
 
 
+def get_Z_kOhm(
+    nu_GHz: ArrayLike,
+    Reff_kohm: float,
+    Ceff_fF: float,
+) -> NDArray[np.complex128]:
+    """Return the complex impedance of the parallel-RC environment.
+
+    Parameters
+    ----------
+    nu_GHz:
+        Frequency in gigahertz.
+    Reff_kohm:
+        Effective parallel resistance in kilohms.
+    Ceff_fF:
+        Effective parallel capacitance in femtofarads.
+
+    Returns
+    -------
+    numpy.ndarray
+        Complex impedance in kilohms, with the shape of ``nu_GHz``.
+
+    Notes
+    -----
+    The impedance is ``R_eff / (1 + 2j * pi * nu * R_eff * C_eff)``.
+    ``Teff_K`` is not an argument because temperature affects the occupation
+    factors in P(E), not the impedance of this circuit model.
+    """
+    frequency_GHz = np.asarray(nu_GHz, dtype=np.float64)
+    resistance_ohm = float(Reff_kohm) * 1e3
+    capacitance_F = float(Ceff_fF) * 1e-15
+
+    if not np.all(np.isfinite(frequency_GHz)):
+        raise ValueError("nu_GHz must contain only finite values.")
+    if not np.isfinite(resistance_ohm) or resistance_ohm <= 0.0:
+        raise ValueError("Reff_kohm must be finite and positive.")
+    if not np.isfinite(capacitance_F) or capacitance_F <= 0.0:
+        raise ValueError("Ceff_fF must be finite and positive.")
+
+    angular_frequency = 2.0 * np.pi * frequency_GHz * 1e9
+    impedance_ohm = resistance_ohm / (
+        1.0 + 1j * angular_frequency * resistance_ohm * capacitance_F
+    )
+    return np.asarray(impedance_ohm * 1e-3, dtype=np.complex128)
+
+
 def _parallel_rc_pe(
     Reff_ohm: float,
     Ceff_F: float,
@@ -184,32 +229,27 @@ def simulate_sc_current_nA(
     return prefactor_nA_ueV * (pe_forward - pe_backward)
 
 
-def sc_to_pe_and_impedance(
+def get_PE__ueV(
     V_mV: ArrayLike,
     Isc_nA: ArrayLike,
+    Teff_K: float = 0.0,
     *,
-    temperature_mK: float = 0.0,
-    maximum_frequency_GHz: float = 100.0,
-    frequency_points: int = 401,
-) -> tuple[
-    NDArray[np.float64],
-    NDArray[np.float64],
-    NDArray[np.float64],
-    NDArray[np.complex128],
-]:
-    """Infer normalized P(E) and effective complex impedance from SC current.
+    energy_taper_fraction: float = 0.2,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Infer the normalized P(E) distribution from a supercurrent trace.
 
     Parameters
     ----------
     V_mV, Isc_nA:
         Voltage and MAR-subtracted supercurrent samples. The voltage data must
         span both polarities. Any even component of the current is removed.
-    temperature_mK:
-        Equilibrium temperature used for detailed balance, in millikelvin.
-    maximum_frequency_GHz:
-        Largest returned positive frequency, in gigahertz.
-    frequency_points:
-        Number of returned frequencies, including zero.
+    Teff_K:
+        Effective equilibrium temperature used for detailed balance, in
+        kelvins.
+    energy_taper_fraction:
+        Fraction of the outer energy range over which P(E) is tapered smoothly
+        to zero. This suppresses ringing caused by the finite voltage window.
+        Set to zero to disable the energy taper.
 
     Returns
     -------
@@ -217,19 +257,12 @@ def sc_to_pe_and_impedance(
         Symmetric energy axis in microelectronvolts.
     pe_per_ueV:
         Normalized P(E) in inverse microelectronvolts.
-    frequency_GHz:
-        Nonnegative frequency axis in gigahertz.
-    impedance_kOhm:
-        Effective complex impedance in kilohms. Its imaginary part is obtained
-        by a regularized Kramers--Kronig reconstruction.
 
     Notes
     -----
     The inversion assumes equilibrium detailed balance and lowest-order
     incoherent Cooper-pair tunnelling. The unknown E_J**2 prefactor cancels
     when P(E) is normalized, so this conversion does not determine ``Ic_nA``.
-    The finite voltage window and sampling resolution make the impedance an
-    effective, regularized spectrum rather than a unique circuit extraction.
     """
     voltage_mV = np.asarray(V_mV, dtype=np.float64)
     current_nA = np.asarray(Isc_nA, dtype=np.float64)
@@ -247,12 +280,10 @@ def sc_to_pe_and_impedance(
     current_nA = current_nA[order]
     if voltage_mV[0] >= 0.0 or voltage_mV[-1] <= 0.0:
         raise ValueError("V_mV must span negative and positive voltages.")
-    if temperature_mK < 0.0:
-        raise ValueError("temperature_mK must be nonnegative.")
-    if maximum_frequency_GHz <= 0.0:
-        raise ValueError("maximum_frequency_GHz must be positive.")
-    if frequency_points < 16:
-        raise ValueError("frequency_points must be at least 16.")
+    if Teff_K < 0.0:
+        raise ValueError("Teff_K must be nonnegative.")
+    if not 0.0 <= energy_taper_fraction <= 1.0:
+        raise ValueError("energy_taper_fraction must be between zero and one.")
 
     # Work on an odd, symmetric, uniform energy grid. Interpolation only makes
     # the Fourier transform well-defined; it does not add experimental detail.
@@ -289,10 +320,10 @@ def sc_to_pe_and_impedance(
         energy_ueV[positive_energy],
         positive_current[positive_energy],
     )
-    if temperature_mK == 0.0:
+    if Teff_K == 0.0:
         pe_per_ueV = np.where(positive_energy, positive_branch, 0.0)
     else:
-        kT_ueV = 86.17333262145 * temperature_mK * 1e-3
+        kT_ueV = 86.17333262145 * Teff_K
         detailed_balance_denominator = -np.expm1(-absolute_energy_ueV / kT_ueV)
         pe_positive = np.divide(
             positive_branch,
@@ -315,6 +346,36 @@ def sc_to_pe_and_impedance(
         raise ValueError("The SC trace does not produce a normalizable P(E).")
     pe_per_ueV /= normalization
 
+    # A finite voltage window is a rectangular truncation of P(E), whose sharp
+    # edges cause Fourier ringing. Smoothly bring the outer part of the energy
+    # distribution to zero before transforming it.
+    if energy_taper_fraction > 0.0:
+        maximum_absolute_energy_ueV = float(np.max(np.abs(energy_ueV)))
+        taper_start_ueV = (
+            1.0 - energy_taper_fraction
+        ) * maximum_absolute_energy_ueV
+        energy_taper = np.ones_like(energy_ueV)
+        edge = np.abs(energy_ueV) > taper_start_ueV
+        edge_coordinate = (
+            np.abs(energy_ueV[edge]) - taper_start_ueV
+        ) / (maximum_absolute_energy_ueV - taper_start_ueV)
+        energy_taper[edge] = 0.5 * (1.0 + np.cos(np.pi * edge_coordinate))
+        pe_per_ueV *= energy_taper
+        pe_per_ueV /= np.trapezoid(pe_per_ueV, energy_ueV)
+
+    return energy_ueV, pe_per_ueV
+
+
+def _pe_to_impedance(
+    energy_ueV: NDArray[np.float64],
+    pe_per_ueV: NDArray[np.float64],
+    nu0_GHz: float,
+    frequency_points: int,
+    time_taper_fraction: float,
+) -> tuple[NDArray[np.float64], NDArray[np.complex128]]:
+    """Convert a normalized P(E) distribution to effective impedance."""
+    sample_count = energy_ueV.size
+
     energy_step_ueV = float(np.mean(np.diff(energy_ueV)))
     energy_step_J = energy_step_ueV * 1e-6 * ELEMENTARY_CHARGE_C
     characteristic = (
@@ -335,9 +396,13 @@ def sc_to_pe_and_impedance(
     phase_derivative = np.gradient(phase, time_s)
 
     taper = np.ones_like(time_s)
-    taper_start = int(0.8 * time_s.size)
-    taper_coordinate = np.linspace(0.0, 1.0, time_s.size - taper_start)
-    taper[taper_start:] = 0.5 * (1.0 + np.cos(np.pi * taper_coordinate))
+    if time_taper_fraction > 0.0:
+        taper_start = int((1.0 - time_taper_fraction) * time_s.size)
+        taper_start = min(taper_start, time_s.size - 1)
+        taper_coordinate = np.linspace(0.0, 1.0, time_s.size - taper_start)
+        taper[taper_start:] = 0.5 * (
+            1.0 + np.cos(np.pi * taper_coordinate)
+        )
 
     # Extend the Kramers--Kronig grid beyond the returned band to reduce edge
     # artefacts in Im[Z]. Re[Z] is even and Im[Z] is odd for a causal circuit.
@@ -345,7 +410,7 @@ def sc_to_pe_and_impedance(
     extended_points = extension_factor * (frequency_points - 1) + 1
     positive_frequency_Hz = np.linspace(
         0.0,
-        extension_factor * maximum_frequency_GHz * 1e9,
+        extension_factor * nu0_GHz * 1e9,
         extended_points,
     )
     cosine = np.cos(2.0 * np.pi * time_s[:, None] * positive_frequency_Hz[None, :])
@@ -370,7 +435,87 @@ def sc_to_pe_and_impedance(
         real_impedance_ohm[returned_slice]
         + 1j * imaginary_impedance_ohm[returned_slice]
     ) * 1e-3
+    return frequency_GHz, impedance_kOhm
+
+
+def get_Zw_kOhm(
+    V_mV: ArrayLike,
+    Isc_nA: ArrayLike,
+    nu0_GHz: float,
+    *,
+    frequency_points: int = 401,
+    energy_taper_fraction: float = 0.2,
+    time_taper_fraction: float = 0.4,
+) -> tuple[NDArray[np.float64], NDArray[np.complex128]]:
+    """Infer effective complex impedance from a supercurrent trace.
+
+    ``nu0_GHz`` is the largest returned frequency. The inversion uses the
+    zero-temperature P(E) reconstruction and returns ``frequency_points``
+    equally spaced frequencies, including zero.
+    """
+    if nu0_GHz <= 0.0:
+        raise ValueError("nu0_GHz must be positive.")
+    if frequency_points < 16:
+        raise ValueError("frequency_points must be at least 16.")
+    if not 0.0 <= time_taper_fraction <= 1.0:
+        raise ValueError("time_taper_fraction must be between zero and one.")
+
+    energy_ueV, pe_per_ueV = get_PE__ueV(
+        V_mV,
+        Isc_nA,
+        energy_taper_fraction=energy_taper_fraction,
+    )
+    return _pe_to_impedance(
+        energy_ueV,
+        pe_per_ueV,
+        nu0_GHz,
+        frequency_points,
+        time_taper_fraction,
+    )
+
+
+def sc_to_pe_and_impedance(
+    V_mV: ArrayLike,
+    Isc_nA: ArrayLike,
+    *,
+    temperature_mK: float = 0.0,
+    maximum_frequency_GHz: float = 100.0,
+    frequency_points: int = 401,
+    energy_taper_fraction: float = 0.2,
+    time_taper_fraction: float = 0.4,
+) -> tuple[
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.complex128],
+]:
+    """Infer P(E) and impedance; retained for backward compatibility."""
+    energy_ueV, pe_per_ueV = get_PE__ueV(
+        V_mV,
+        Isc_nA,
+        Teff_K=temperature_mK * 1e-3,
+        energy_taper_fraction=energy_taper_fraction,
+    )
+    if maximum_frequency_GHz <= 0.0:
+        raise ValueError("maximum_frequency_GHz must be positive.")
+    if frequency_points < 16:
+        raise ValueError("frequency_points must be at least 16.")
+    if not 0.0 <= time_taper_fraction <= 1.0:
+        raise ValueError("time_taper_fraction must be between zero and one.")
+    frequency_GHz, impedance_kOhm = _pe_to_impedance(
+        energy_ueV,
+        pe_per_ueV,
+        maximum_frequency_GHz,
+        frequency_points,
+        time_taper_fraction,
+    )
     return energy_ueV, pe_per_ueV, frequency_GHz, impedance_kOhm
 
 
-__all__ = ["sc_to_pe_and_impedance", "simulate_sc_current_nA"]
+__all__ = [
+    "get_PE__ueV",
+    "get_Z_kOhm",
+    "get_Zw_kOhm",
+    "sc_to_pe_and_impedance",
+    "simulate_sc_current_nA",
+]
