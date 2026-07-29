@@ -15,10 +15,11 @@ def get_weights(
 ) -> NDArray[np.float64] | tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Return smooth voltage-dependent weights for MAR orders 1 through mmax.
 
-    The weights reproduce the threshold partition used in ``sim.py``.  Each
-    MAR order is centered on its subharmonic-gap threshold
+    Each MAR order is represented by a Gaussian on the inverse-voltage axis
 
-    ``abs(V) / Delta = 2 / m``.
+    ``2 Delta / abs(V)``
+
+    and is centered on the integer corresponding to that MAR order.
 
     Parameters
     ----------
@@ -80,32 +81,31 @@ def get_weights(
         mmax + 1,
         int(np.ceil(2.0 / step - 1e-12)),
     )
-    construction_orders = np.arange(1, construction_mmax + 2)
-    construction_centers = 2.0 / construction_orders
-    centers = construction_centers[:construction_mmax]
-    neighbor_spacings = construction_centers[:-1] - construction_centers[1:]
-
-    lower_widths = 0.45 * neighbor_spacings[:construction_mmax]
-    higher_widths = np.empty_like(centers)
-    higher_widths[0] = neighbor_spacings[0]
-    higher_widths[1:] = neighbor_spacings[: construction_mmax - 1]
-    higher_widths *= 0.45
-
-    distance = np.abs(voltage)[None, :] - centers[:, None]
-    widths = np.where(
-        distance < 0.0,
-        lower_widths[:, None],
-        higher_widths[:, None],
+    construction_orders = np.arange(
+        1,
+        construction_mmax + 1,
+        dtype=np.float64,
     )
-    weights = np.exp(-0.5 * (distance / widths) ** 2)
-
-    # Complete the partition with the smooth central overflow basis used in
-    # sim.py, then return only the explicitly requested orders.
-    transition = 0.25 * neighbor_spacings[construction_mmax - 1]
-    exponent = (np.abs(voltage) - centers[-1]) / transition
-    overflow_weight = 1.0 / (
-        1.0 + np.exp(np.clip(exponent, -700.0, 700.0))
+    abs_voltage = np.abs(voltage)
+    inverse_voltage = np.divide(
+        2.0,
+        abs_voltage,
+        out=np.full_like(abs_voltage, np.inf),
+        where=abs_voltage != 0.0,
     )
+    width = 0.5
+    distance = inverse_voltage[None, :] - construction_orders[:, None]
+    weights = np.exp(-0.5 * (distance / width) ** 2)
+
+    # Represent all orders above the grid-resolved range by the rising half of
+    # the next Gaussian and a unit plateau towards zero voltage. This gives an
+    # equal crossover halfway between the last resolved and first unresolved
+    # integer order.
+    overflow_distance = np.maximum(
+        construction_mmax + 1.0 - inverse_voltage,
+        0.0,
+    )
+    overflow_weight = np.exp(-0.5 * (overflow_distance / width) ** 2)
     normalization = np.sum(weights, axis=0) + overflow_weight
     weights /= normalization[None, :]
     overflow_weight /= normalization
