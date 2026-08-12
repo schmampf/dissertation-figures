@@ -1,0 +1,21 @@
+\begingroup
+\begin{minipage}[t][2.1in][t]{1.35in}
+\def\thesispanelwidth{1.35in}
+\def\thesispanelheight{1.35in}
+\def\thesisstackwidth{1.35in}
+\def\thesisstackheight{2.1in}
+\def\thesisposxwaterfall{0in}
+\def\thesisposxsurface{0in}
+\def\thesisposxheatmap{0in}
+\def\thesisposywaterfall{1.05in}
+\def\thesisposysurface{0.3in}
+\def\thesisposyheatmap{0in}
+\begin{pgfpicture}
+\pgfpathrectangle{\pgfpointorigin}{\pgfpoint{\thesisstackwidth}{\thesisstackheight}}
+\pgfusepath{use as bounding box}
+\pgftext[left,bottom,at={\pgfpoint{\thesisposxheatmap}{\thesisposyheatmap}}]{\input{heatmap.pgf}}
+\pgftext[left,bottom,at={\pgfpoint{\thesisposxsurface}{\thesisposysurface}}]{\input{surface.pgf}}
+\pgftext[left,bottom,at={\pgfpoint{\thesisposxwaterfall}{\thesisposywaterfall}}]{\input{waterfall.pgf}}
+\end{pgfpicture}
+\end{minipage}
+\endgroup
