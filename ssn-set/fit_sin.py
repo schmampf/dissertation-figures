@@ -16,7 +16,6 @@ from superconductivity.utilities.functions.upsampling import upsample
 # get data single-iv tb
 file = "/Users/oliver/Documents/measurement data/SSET/22 02b Scheer2/36_9 - unbroken/SCGateMap.tdms"
 key = "2022-02-17 20:45:50 G3.60mV"
-nu_sample_Hz, amp, rref = 5000.0, (2000.0, 500.0), 102000.0
 dt_sample_s = 0.00019999999999999998
 nu_downsample_Hz = 43.0
 dt_downsample_s = 1 / nu_downsample_Hz
@@ -26,6 +25,11 @@ sweep = (25_000, 75_000)
 Vbias0_mV = np.linspace(-0.7, 0.7, 3501)
 
 with TdmsFile.open(file) as f:
+    amp = (
+        f.properties["s_ampl_sample_effective_gain"],
+        f.properties["s_ampl_reference_effective_gain"],
+    )
+    rref = f.properties["s_ampl_resistor"]
     sample_V = f[key]["Sample"].as_dataframe()
     reference_V = f[key]["Reference"].as_dataframe()
     sample_V = sample_V.values
@@ -55,12 +59,12 @@ FIT_SIGMA_V = False
 
 def simulate_sin_current_nA(
     V_mV: np.ndarray,
-    G_T_uS: float = 61.7631,
+    G_T_uS: float = 30.88155,
     T_K: float = 0.0681028,
     Delta_meV: float = 0.196106,
     gamma_meV: float = 0.000861382,
     V0_uV: float = -4.55651,
-    I0_nA: float = -0.216369,
+    I0_nA: float = -0.1081845,
     sigmaV_uV: float = 0.0,
 ) -> np.ndarray:
     """Simulate a Dynes-broadened SIN tunnel-junction current.
@@ -142,12 +146,12 @@ Iopt_nA = Ifit_nA[::fit_stride]
 
 initial = np.array(
     [
-        np.log(60.0),
-        np.log(0.10),
-        0.18,
-        np.log(0.002),
-        0.0,
-        0.0,
+        np.log(30.88155),
+        np.log(0.0681028),
+        0.196106,
+        np.log(0.000861382),
+        -4.55651,
+        -0.1081845,
     ]
 )
 lower = np.array(
@@ -180,7 +184,7 @@ fit_result = least_squares(
     initial,
     bounds=(lower, upper),
     loss="soft_l1",
-    f_scale=0.05,
+    f_scale=0.025,
     x_scale="jac",
     max_nfev=500,
 )
