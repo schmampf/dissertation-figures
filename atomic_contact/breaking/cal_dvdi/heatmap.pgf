@@ -277,7 +277,7 @@
 \definecolor{textcolor}{rgb}{0.000000,0.000000,0.000000}%
 \pgfsetstrokecolor{textcolor}%
 \pgfsetfillcolor{textcolor}%
-\pgftext[x=0.231133in,y=0.130264in,,,rotate=337.628088]{\color{textcolor}{\sffamily\fontsize{6.000000}{7.200000}\selectfont\catcode`\^=\active\def^{\ifmmode\sp\else\^{}\fi}\catcode`\%=\active\def%{\%}$x\ (\mathring{\mathrm{A}})$}}%
+\pgftext[x=0.231133in,y=0.130264in,,,rotate=337.628088]{\color{textcolor}{\sffamily\fontsize{6.000000}{7.200000}\selectfont\catcode`\^=\active\def^{\ifmmode\sp\else\^{}\fi}\catcode`\%=\active\def%{\%}$x\ (\mathrm{Å})$}}%
 \end{pgfscope}%
 \begin{pgfscope}%
 \pgfsys@transformshift{0.111852in}{0.169259in}%
@@ -417,7 +417,7 @@
 \definecolor{textcolor}{rgb}{0.000000,0.000000,0.000000}%
 \pgfsetstrokecolor{textcolor}%
 \pgfsetfillcolor{textcolor}%
-\pgftext[x=0.231133in,y=0.130264in,,,rotate=337.628088]{\color{textcolor}{\sffamily\fontsize{6.000000}{7.200000}\selectfont\catcode`\^=\active\def^{\ifmmode\sp\else\^{}\fi}\catcode`\%=\active\def%{\%}$x\ (\mathring{\mathrm{A}})$}}%
+\pgftext[x=0.231133in,y=0.130264in,,,rotate=337.628088]{\color{textcolor}{\sffamily\fontsize{6.000000}{7.200000}\selectfont\catcode`\^=\active\def^{\ifmmode\sp\else\^{}\fi}\catcode`\%=\active\def%{\%}$x\ (\mathrm{Å})$}}%
 \end{pgfscope}%
 \end{pgfpicture}%
 \makeatother%
